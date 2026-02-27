@@ -1,0 +1,11 @@
+dotenv
+diffusers
+torch
+transformers
+accelerate
+tqdm
+numpy
+pillow
+opencv-python
+ultralytics
+matplotlib
