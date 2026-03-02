@@ -74,6 +74,8 @@ def load_cubic(cubic_path_root, prefix="frame_"):
             cubic_frames["left"].append(cv2.flip(cv2.imread(f"{cubic_path_root}/{folder_name}/right.png"), 1))
         else:
             print(f"Skipping {folder_name} (does not exist)")
+    
+    return cubic_frames
 
 
 def display_cubic(cubic_frames):
