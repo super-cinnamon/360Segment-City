@@ -30,7 +30,6 @@ depth_estimation_pipeline = load_pipeline()
 
 
 def predict_depth(image, pipe=depth_estimation_pipeline, hyperparameters=CONFIG["depth_estimation"]["hyperparameters"]):
-    depth_output_image = []
     # make image into PIL Image
     input_image = Image.fromarray(image)
 
@@ -51,9 +50,7 @@ def predict_depth(image, pipe=depth_estimation_pipeline, hyperparameters=CONFIG[
         depth_pred: np.ndarray = pipeline_output.depth_np
         depth_colored: Image.Image = pipeline_output.depth_colored
 
-        # Save to the list
-        depth_output_image.append(depth_colored)
-    return depth_output_image
+    return depth_colored
 
 
 def predict_depths(images, pipe=depth_estimation_pipeline, hyperparameters=CONFIG["depth_estimation"]["hyperparameters"]):
