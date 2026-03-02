@@ -1,4 +1,5 @@
 import gc
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from transformers import OneFormerProcessor, OneFormerForUniversalSegmentation
 import torch
