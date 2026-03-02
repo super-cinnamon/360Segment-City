@@ -30,7 +30,7 @@ def load_pipeline(
 depth_estimation_pipeline = load_pipeline()
 
 
-def predict_depths(pipe=depth_estimation_pipeline, images, hyperparameters=CONFIG["depth_estimation"]["hyperparameters"]):
+def predict_depths(images, pipe=depth_estimation_pipeline, hyperparameters=CONFIG["depth_estimation"]["hyperparameters"]):
     depth_output_images = []
     with torch.no_grad():
         for input_image in tqdm(images, desc=f"Estimating depth", leave=True):
@@ -55,14 +55,14 @@ def predict_depths(pipe=depth_estimation_pipeline, images, hyperparameters=CONFI
     return depth_output_images
 
 
-def predict_cubic_depths(pipe=depth_estimation_pipeline, cubic_frames):
+def predict_cubic_depths(cubic_frames, pipe=depth_estimation_pipeline):
     # parallel process all of the sides and recompile them into a list of dicts
     # use ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=4) as executor:
-        future_left = executor.submit(predict_depths, pipe, cubic_frames["left"])
-        future_right = executor.submit(predict_depths, pipe, cubic_frames["right"])
-        future_front = executor.submit(predict_depths, pipe, cubic_frames["front"])
-        future_back = executor.submit(predict_depths, pipe, cubic_frames["back"])
+        future_left = executor.submit(predict_depths, cubic_frames["left"], pipe)
+        future_right = executor.submit(predict_depths, cubic_frames["right"], pipe)
+        future_front = executor.submit(predict_depths, cubic_frames["front"], pipe)
+        future_back = executor.submit(predict_depths, cubic_frames["back"], pipe)
 
         left_depths = future_left.result()
         right_depths = future_right.result()

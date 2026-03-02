@@ -54,7 +54,7 @@ def predict_segmentations(images, processor, model, task=CONFIG["segmentation"][
     return results
 
 
-def predict_cubic_segmentations(processor=segmentation_processor, model=segmentation_model, cubic_frames):
+def predict_cubic_segmentations(cubic_frames, processor=segmentation_processor, model=segmentation_model):
     # parallel process all of the sides and recompile them into a list of dicts
     # use ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=4) as executor:
