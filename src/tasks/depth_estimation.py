@@ -13,7 +13,6 @@ from src.tasks.config.utils import CONFIG, DEVICE
 
 def load_pipeline(
     model_name=CONFIG["depth_estimation"]["model_name"],
-    pipeline_task=CONFIG["depth_estimation"]["pipeline_task"],
     device=DEVICE
     ):
     pipe = DiffusionPipeline.from_pretrained(
