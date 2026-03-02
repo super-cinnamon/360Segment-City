@@ -1,5 +1,6 @@
 import json
 import torch
+import os
 
 
 # load config
@@ -9,7 +10,7 @@ def load_config(config_path):
     return config
 
 
-CONFIG = load_config("config.json")
+CONFIG = load_config(os.path.join(os.path.dirname(__file__), "config.json"))
 
 # check device
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
