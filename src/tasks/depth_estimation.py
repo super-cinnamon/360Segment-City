@@ -26,7 +26,11 @@ def load_pipeline(
     return pipe
 
 
-def predict_depths(pipe, images, hyperparameters=CONFIG["depth_estimation"]["hyperparameters"]):
+# load pipeline
+depth_estimation_pipeline = load_pipeline()
+
+
+def predict_depths(pipe=depth_estimation_pipeline, images, hyperparameters=CONFIG["depth_estimation"]["hyperparameters"]):
     depth_output_images = []
     with torch.no_grad():
         for input_image in tqdm(images, desc=f"Estimating depth", leave=True):
@@ -51,7 +55,7 @@ def predict_depths(pipe, images, hyperparameters=CONFIG["depth_estimation"]["hyp
     return depth_output_images
 
 
-def predict_cubic_depths(pipe, cubic_frames):
+def predict_cubic_depths(pipe=depth_estimation_pipeline, cubic_frames):
     # parallel process all of the sides and recompile them into a list of dicts
     # use ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=4) as executor:
