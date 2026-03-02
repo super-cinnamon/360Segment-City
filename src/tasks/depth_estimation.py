@@ -29,28 +29,43 @@ def load_pipeline(
 depth_estimation_pipeline = load_pipeline()
 
 
+def predict_depth(image, pipe=depth_estimation_pipeline, hyperparameters=CONFIG["depth_estimation"]["hyperparameters"]):
+    depth_output_image = []
+    # make image into PIL Image
+    input_image = Image.fromarray(image)
+
+    with torch.no_grad():
+        # Predict depth
+        pipeline_output = pipe(
+            input_image,
+            denoising_steps=hyperparameters["denoising_steps"],     # optional
+            ensemble_size=hyperparameters["ensemble_size"],       # optional
+            processing_res=hyperparameters["processing_res"],     # optional
+            match_input_res=hyperparameters["match_input_res"],   # optional
+            batch_size=0,           # optional
+            color_map="Spectral",   # optional
+            show_progress_bar=True, # optional
+            # seed=seed,              # optional
+        )
+
+        depth_pred: np.ndarray = pipeline_output.depth_np
+        depth_colored: Image.Image = pipeline_output.depth_colored
+
+        # Save to the list
+        depth_output_image.append(depth_colored)
+    return depth_output_image
+
+
 def predict_depths(images, pipe=depth_estimation_pipeline, hyperparameters=CONFIG["depth_estimation"]["hyperparameters"]):
     depth_output_images = []
     with torch.no_grad():
         for input_image in tqdm(images, desc=f"Estimating depth", leave=True):
             # Predict depth
-            pipeline_output = pipe(
-                input_image,
-                denoising_steps=hyperparameters["denoising_steps"],     # optional
-                ensemble_size=hyperparameters["ensemble_size"],       # optional
-                processing_res=hyperparameters["processing_res"],     # optional
-                match_input_res=hyperparameters["match_input_res"],   # optional
-                batch_size=0,           # optional
-                color_map="Spectral",   # optional
-                show_progress_bar=True, # optional
-                # seed=seed,              # optional
-            )
-
-            depth_pred: np.ndarray = pipeline_output.depth_np
-            depth_colored: Image.Image = pipeline_output.depth_colored
+            depth_output_image = predict_depth(input_image, pipe, hyperparameters)
 
             # Save to the list
-            depth_output_images.append(depth_colored)
+            depth_output_images.append(depth_output_image)
+
     return depth_output_images
 
 
