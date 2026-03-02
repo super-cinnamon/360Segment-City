@@ -45,6 +45,8 @@ def predict_segmentation(image, processor, model, task=CONFIG["segmentation"]["t
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+    return predicted_map
+
 
 def predict_segmentations(images, processor, model, task=CONFIG["segmentation"]["task"]):
     results = []
