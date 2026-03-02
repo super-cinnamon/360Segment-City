@@ -47,7 +47,7 @@ def save_frames():
     pass
 
 
-def load_cubic(cubic_path_root, prefix="frame_"):
+def load_cubic(cubic_path_root, prefix="frame_", resizing_factor=0.5):
     cubic_frames = {
         "left": [],
         "right": [],
@@ -66,12 +66,12 @@ def load_cubic(cubic_path_root, prefix="frame_"):
 
         if folder_path.exists():
             # print(f"Found {folder_name}")
-            cubic_frames["back"].append(cv2.flip(cv2.imread(f"{cubic_path_root}/{folder_name}/back.png"), 1))
-            cubic_frames["front"].append(cv2.flip(cv2.imread(f"{cubic_path_root}/{folder_name}/front.png"), 1))
+            cubic_frames["back"].append(cv2.resize(cv2.flip(cv2.imread(f"{cubic_path_root}/{folder_name}/back.png"), 1), (0, 0), fx=resizing_factor, fy=resizing_factor))
+            cubic_frames["front"].append(cv2.resize(cv2.flip(cv2.imread(f"{cubic_path_root}/{folder_name}/front.png"), 1), (0, 0), fx=resizing_factor, fy=resizing_factor))
 
             # left and right are flipped due to mirroring effect
-            cubic_frames["right"].append(cv2.flip(cv2.imread(f"{cubic_path_root}/{folder_name}/left.png"), 1))
-            cubic_frames["left"].append(cv2.flip(cv2.imread(f"{cubic_path_root}/{folder_name}/right.png"), 1))
+            cubic_frames["right"].append(cv2.resize(cv2.flip(cv2.imread(f"{cubic_path_root}/{folder_name}/left.png"), 1), (0, 0), fx=resizing_factor, fy=resizing_factor))
+            cubic_frames["left"].append(cv2.resize(cv2.flip(cv2.imread(f"{cubic_path_root}/{folder_name}/right.png"), 1), (0, 0), fx=resizing_factor, fy=resizing_factor))
         else:
             print(f"Skipping {folder_name} (does not exist)")
     
