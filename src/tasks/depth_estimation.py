@@ -5,6 +5,9 @@ from tqdm import tqdm
 import torch
 from diffusers import DiffusionPipeline
 
+# for parallel processing
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from src.tasks.config.utils import CONFIG, DEVICE
 
 
@@ -50,10 +53,17 @@ def predict_depths(pipe, images, hyperparameters=CONFIG["depth_estimation"]["hyp
 
 def predict_cubic_depths(pipe, cubic_frames):
     # parallel process all of the sides and recompile them into a list of dicts
-    left_depths = predict_depths(pipe, cubic_frames["left"])
-    right_depths = predict_depths(pipe, cubic_frames["right"])
-    front_depths = predict_depths(pipe, cubic_frames["front"])
-    back_depths = predict_depths(pipe, cubic_frames["back"])
+    # use ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        future_left = executor.submit(predict_depths, pipe, cubic_frames["left"])
+        future_right = executor.submit(predict_depths, pipe, cubic_frames["right"])
+        future_front = executor.submit(predict_depths, pipe, cubic_frames["front"])
+        future_back = executor.submit(predict_depths, pipe, cubic_frames["back"])
+
+        left_depths = future_left.result()
+        right_depths = future_right.result()
+        front_depths = future_front.result()
+        back_depths = future_back.result()
 
     return {
         "left": left_depths,

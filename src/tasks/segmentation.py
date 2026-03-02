@@ -51,3 +51,25 @@ def predict_segmentations(images, processor, model, task=CONFIG["segmentation"][
         result = predict_segmentation(image, processor, model, task)
         results.append(result)
     return results
+
+
+def predict_cubic_segmentations(processor, model, cubic_frames):
+    # parallel process all of the sides and recompile them into a list of dicts
+    # use ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        future_left = executor.submit(predict_segmentations, cubic_frames["left"], processor, model)
+        future_right = executor.submit(predict_segmentations, cubic_frames["right"], processor, model)
+        future_front = executor.submit(predict_segmentations, cubic_frames["front"], processor, model)
+        future_back = executor.submit(predict_segmentations, cubic_frames["back"], processor, model)
+
+        left_segmentations = future_left.result()
+        right_segmentations = future_right.result()
+        front_segmentations = future_front.result()
+        back_segmentations = future_back.result()
+
+    return {
+        "left": left_segmentations,
+        "right": right_segmentations,
+        "front": front_segmentations,
+        "back": back_segmentations,
+    }
