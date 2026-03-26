@@ -8,7 +8,7 @@ from diffusers import DiffusionPipeline
 # for parallel processing
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from src.tasks.config.utils import CONFIG, DEVICE
+from src.config.utils import CONFIG, DEVICE
 
 
 def load_pipeline(

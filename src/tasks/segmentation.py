@@ -5,7 +5,7 @@ from transformers import OneFormerProcessor, OneFormerForUniversalSegmentation
 import torch
 from tqdm import tqdm
 
-from src.tasks.config.utils import CONFIG, DEVICE
+from src.config.utils import CONFIG, DEVICE
 
 
 # TODO maybe move all to init or utils for avoiding reloads and circular imports
