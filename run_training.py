@@ -5,7 +5,9 @@ import math
 import argparse
 
 import torch
-from torch.utils.data import DataLoader
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, DistributedSampler
 
 # ---------------------------------------------------------------------------
 # PROJECT IMPORTS
@@ -37,13 +39,71 @@ CLASS_NAME_TO_ID = {name: idx for idx, name in enumerate(BDD100K_CLASSES)}
 #   for the corresponding image, and converts boxes to the model's expected
 #   format: [cx, cy, w, h] normalised to [0, 1].
 # ---------------------------------------------------------------------------
-def load_bdd100k_data(image_dir: str, label_dir: str):
+def _process_label_data(image_dir: str, img_name: str, label_data: dict):
+    """
+    Helper to process a single image's annotation data from BDD100K format.
+    """
+    img_path = os.path.join(image_dir, img_name)
+
+    # Skip if the corresponding image doesn't exist on disk.
+    if not os.path.exists(img_path):
+        return None, None
+
+    boxes  = []
+    labels = []
+
+    # BDD100K original image resolution (used for normalisation).
+    IMG_W = 1280.0
+    IMG_H = 720.0
+
+    # Handle both multi-file format (has 'frames') and singular-file format (has 'labels' directly).
+    if "frames" in label_data:
+        # Multi-file format: frames -> objects
+        objects_list = [obj for frame in label_data.get("frames", []) for obj in frame.get("objects", [])]
+    else:
+        # Singular-file format: labels -> objects
+        objects_list = label_data.get("labels", [])
+
+    for obj in objects_list:
+        cat = obj.get("category", "")
+
+        # Skip objects whose category is not in our 10-class vocabulary
+        # or that don't have a "box2d" annotation.
+        if cat not in CLASS_NAME_TO_ID or "box2d" not in obj:
+            continue
+
+        # Extract axis-aligned box in pixel coordinates.
+        x1 = obj["box2d"]["x1"]
+        y1 = obj["box2d"]["y1"]
+        x2 = obj["box2d"]["x2"]
+        y2 = obj["box2d"]["y2"]
+
+        # Convert from [x1, y1, x2, y2] pixel coords to
+        # [cx, cy, w, h] normalised to [0, 1] in image space.
+        w  = (x2 - x1) / IMG_W
+        h  = (y2 - y1) / IMG_H
+        cx = (x1 / IMG_W) + (w / 2)
+        cy = (y1 / IMG_H) + (h / 2)
+
+        boxes.append([cx, cy, w, h])
+        labels.append(CLASS_NAME_TO_ID[cat])
+
+    if len(boxes) > 0:
+        return img_path, {
+            "boxes":  torch.tensor(boxes,  dtype=torch.float32),
+            "labels": torch.tensor(labels, dtype=torch.long),
+        }
+    return None, None
+
+
+def load_bdd100k_data(image_dir: str, label_path: str):
     """
     Load BDD100K images and annotations.
 
     Args:
-        image_dir : Path to the directory containing BDD100K .jpg images.
-        label_dir : Path to the directory containing BDD100K .json label files.
+        image_dir  : Path to the directory containing BDD100K .jpg images.
+        label_path : Path to the directory (multi-file) or single file (singular format)
+                     containing BDD100K labels.
 
     Returns:
         img_paths   : List of absolute paths to images that have ≥1 valid box.
@@ -52,62 +112,34 @@ def load_bdd100k_data(image_dir: str, label_dir: str):
     img_paths   = []
     annotations = []
 
-    # Glob all JSON files in the label directory.
-    label_files = glob.glob(os.path.join(label_dir, "*.json"))
+    if os.path.isdir(label_path):
+        # Glob all JSON files in the label directory (Original Format).
+        label_files = glob.glob(os.path.join(label_path, "*.json"))
+        for label_file in label_files:
+            with open(label_file, "r") as f:
+                data = json.load(f)
+            
+            # BDD100K label format: data["name"] = image basename (without extension).
+            img_name = data["name"] + ".jpg"
+            path, ann = _process_label_data(image_dir, img_name, data)
+            if path:
+                img_paths.append(path)
+                annotations.append(ann)
 
-    for label_file in label_files:
-        with open(label_file, "r") as f:
+    elif os.path.isfile(label_path):
+        # Single JSON file containing all labels (New Format).
+        with open(label_path, "r") as f:
             data = json.load(f)
-
-        # BDD100K label format: data["name"] = image basename (without extension).
-        img_name = data["name"] + ".jpg"
-        img_path = os.path.join(image_dir, img_name)
-
-        # Skip if the corresponding image doesn't exist on disk.
-        if not os.path.exists(img_path):
-            continue
-
-        boxes  = []
-        labels = []
-
-        # BDD100K original image resolution (used for normalisation).
-        IMG_W = 1280.0
-        IMG_H = 720.0
-
-        # Each label file may contain multiple frames (video sequences).
-        # We collect all 2-D bounding boxes across all frames.
-        for frame in data.get("frames", []):
-            for obj in frame.get("objects", []):
-                cat = obj.get("category", "")
-
-                # Skip objects whose category is not in our 10-class vocabulary
-                # or that don't have a "box2d" annotation.
-                if cat not in CLASS_NAME_TO_ID or "box2d" not in obj:
-                    continue
-
-                # Extract axis-aligned box in pixel coordinates.
-                x1 = obj["box2d"]["x1"]
-                y1 = obj["box2d"]["y1"]
-                x2 = obj["box2d"]["x2"]
-                y2 = obj["box2d"]["y2"]
-
-                # Convert from [x1, y1, x2, y2] pixel coords to
-                # [cx, cy, w, h] normalised to [0, 1] in image space.
-                w  = (x2 - x1) / IMG_W
-                h  = (y2 - y1) / IMG_H
-                cx = (x1 / IMG_W) + (w / 2)
-                cy = (y1 / IMG_H) + (h / 2)
-
-                boxes.append([cx, cy, w, h])
-                labels.append(CLASS_NAME_TO_ID[cat])
-
-        # Only include images that have at least one annotated object.
-        if len(boxes) > 0:
-            img_paths.append(img_path)
-            annotations.append({
-                "boxes":  torch.tensor(boxes,  dtype=torch.float32),
-                "labels": torch.tensor(labels, dtype=torch.long),
-            })
+        
+        # New format has a list of items under the "root" key.
+        for item in data.get("root", []):
+            img_name = item.get("name", "")
+            path, ann = _process_label_data(image_dir, img_name, item)
+            if path:
+                img_paths.append(path)
+                annotations.append(ann)
+    else:
+        print(f"Warning: Label path {label_path} not found.")
 
     return img_paths, annotations
 
@@ -193,6 +225,28 @@ def build_lr_scheduler(
     return scheduler
 
 
+def setup_distributed():
+    """
+    Initialize the distributed process group based on environment variables
+    set by torchrun or other distributed launchers.
+    """
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+        dist.init_process_group(
+            backend="nccl" if torch.cuda.is_available() else "gloo",
+            init_method="env://",
+            world_size=world_size,
+            rank=rank
+        )
+        torch.cuda.set_device(local_rank)
+        return rank, world_size, local_rank
+    else:
+        return 0, 1, 0
+
+
 # ---------------------------------------------------------------------------
 # MAIN ENTRY POINT
 # ---------------------------------------------------------------------------
@@ -266,12 +320,22 @@ def main():
         percentage=args.val_percentage,
     )
 
+    # ------------------------------------------------------------------
+    # DISTRIBUTED SETUP
+    # ------------------------------------------------------------------
+    rank, world_size, local_rank = setup_distributed()
+    is_dist = world_size > 1
+
+    train_sampler = DistributedSampler(train_dataset) if is_dist else None
+    val_sampler   = DistributedSampler(val_dataset, shuffle=False) if is_dist else None
+
     # num_workers=0 keeps data loading in the main process; increase if you
     # have many CPU cores and I/O is a bottleneck.
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,                  # Shuffle for better gradient diversity
+        shuffle=(train_sampler is None),  # Sampler handles shuffling in DDP
+        sampler=train_sampler,
         collate_fn=collate_fn,
         num_workers=0,
         pin_memory=True,               # Faster host→GPU transfers
@@ -280,6 +344,7 @@ def main():
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,                 # Deterministic order for validation
+        sampler=val_sampler,
         collate_fn=collate_fn,
         num_workers=0,
         pin_memory=True,
@@ -298,6 +363,12 @@ def main():
     )
     print(f"  Backbone    : {CONFIG['train']['dino_backbone']}")
     print(f"  Num classes : {CONFIG['train']['num_classes']}")
+
+    # Move model to local GPU and wrap in DDP if necessary
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    if is_dist:
+        model = DDP(model, device_ids=[local_rank] if torch.cuda.is_available() else None)
 
     # ------------------------------------------------------------------
     # LOSS CRITERION
@@ -352,19 +423,18 @@ def main():
         eta_min=args.lr / 10,             # Decay to base_lr / 10 (≈ paper's ÷10)
     )
 
+    #   Single-GPU training or Multi-GPU (DDP via torchrun).
     # ------------------------------------------------------------------
-    # DEVICE SELECTION
-    #
-    #   Use CUDA if available.  Single-GPU training only; multi-GPU
-    #   (DDP) would require additional setup not included here.
-    # ------------------------------------------------------------------
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"  Device: {device}")
+    if rank == 0:
+        print(f"  Device: {device}")
+        if is_dist:
+            print(f"  Distributed training enabled (world_size={world_size})")
 
     # ------------------------------------------------------------------
     # TRAINING
     # ------------------------------------------------------------------
-    print("\nStarting training loop...")
+    if rank == 0:
+        print("\nStarting training loop...")
     train_plain_detr(
         model=model,
         train_loader=train_loader,
@@ -376,7 +446,12 @@ def main():
         save_path=args.save_path,
         checkpoint_interval=args.checkpoint_interval,
         scheduler=scheduler,
+        rank=rank,
+        world_size=world_size,
     )
+
+    if is_dist:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
