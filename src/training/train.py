@@ -352,6 +352,8 @@ def train_plain_detr(
     checkpoint_interval:int   = 1,           # Save checkpoint every N epochs
     val_loader:         DataLoader = None,
     scheduler=None,
+    rank:               int   = 0,
+    world_size:         int   = 1,
 ):
     """
     Main training loop for PlainDETR.
@@ -384,14 +386,21 @@ def train_plain_detr(
     # ------------------------------------------------------------------
     checkpoint_file = os.path.join(save_path, "latest_checkpoint.pth")
     if os.path.exists(checkpoint_file):
-        print(f"[Resume] Loading checkpoint: {checkpoint_file}")
+        if rank == 0:
+            print(f"[Resume] Loading checkpoint: {checkpoint_file}")
+        # map_location ensures parameters are loaded to the correct device
         checkpoint = torch.load(checkpoint_file, map_location=device)
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         start_epoch = checkpoint["epoch"] + 1
-        print(f"[Resume] Resuming from epoch {start_epoch}")
+        if rank == 0:
+            print(f"[Resume] Resuming from epoch {start_epoch}")
 
     for epoch in range(start_epoch, epochs):
+
+        # In distributed mode, set_epoch ensures different shuffling each epoch
+        if world_size > 1 and hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
+            train_loader.sampler.set_epoch(epoch)
 
         # ------------------------------------------------------------------
         # TRAINING PHASE
@@ -399,7 +408,11 @@ def train_plain_detr(
         model.train()
         epoch_loss = 0.0
 
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs} [train]")
+        pbar = tqdm(
+            train_loader, 
+            desc=f"Epoch {epoch + 1}/{epochs} [train]",
+            disable=(rank != 0)
+        )
 
         for images, targets in pbar:
             # images is a list of Tensors with different H×W due to
@@ -442,7 +455,8 @@ def train_plain_detr(
             })
 
         avg_loss = epoch_loss / max(len(train_loader), 1)
-        print(f"Epoch {epoch + 1} | Avg Train Loss: {avg_loss:.4f}")
+        if rank == 0:
+            print(f"Epoch {epoch + 1} | Avg Train Loss: {avg_loss:.4f}")
 
         # Step LR scheduler once per epoch (if provided).
         if scheduler is not None:
@@ -455,7 +469,11 @@ def train_plain_detr(
             model.eval()
             val_loss = 0.0
 
-            val_pbar = tqdm(val_loader, desc=f"Epoch {epoch + 1}/{epochs} [val]")
+            val_pbar = tqdm(
+                val_loader, 
+                desc=f"Epoch {epoch + 1}/{epochs} [val]",
+                disable=(rank != 0)
+            )
             with torch.no_grad():
                 for val_images, val_targets in val_pbar:
                     val_images  = pad_batch(val_images).to(device)
@@ -476,12 +494,13 @@ def train_plain_detr(
                     val_pbar.set_postfix({"val_loss": f"{val_losses.item():.4f}"})
 
             avg_val_loss = val_loss / max(len(val_loader), 1)
-            print(f"Epoch {epoch + 1} | Avg Val Loss: {avg_val_loss:.4f}")
+            if rank == 0:
+                print(f"Epoch {epoch + 1} | Avg Val Loss: {avg_val_loss:.4f}")
 
         # ------------------------------------------------------------------
         # CHECKPOINT SAVING
         # ------------------------------------------------------------------
-        if (epoch + 1) % checkpoint_interval == 0:
+        if (epoch + 1) % checkpoint_interval == 0 and rank == 0:
             if not os.path.exists(save_path):
                 os.makedirs(save_path)
 
