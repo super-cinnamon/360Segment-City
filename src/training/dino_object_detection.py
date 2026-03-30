@@ -547,24 +547,38 @@ def run_inference(model, image_tensor, threshold=0.5, display=True):
     # Add a batch dimension → (1, 3, H, W)
     outputs = model(image_tensor.unsqueeze(0))
 
-    # Convert O2O class logits to probabilities; drop the background class.
-    # probas shape: (num_queries, num_classes)
-    probas = outputs["pred_logits"].softmax(-1)[0, :, :-1]
-
+    # Convert logits to probabilities using sigmoid (matches Sigmoid Focal Loss used in training).
+    # We take only the first num_classes logits, as the model was trained by 
+    # supervising only these and ignoring the 11th "background" logit.
+    num_classes = model.class_embed.out_features - 1
+    probas = outputs["pred_logits"].sigmoid()[0, :, :num_classes]
+    
     # Keep only detections whose maximum class probability exceeds threshold.
-    keep = probas.max(-1).values > threshold
+    max_probs = probas.max(-1).values
+    keep = max_probs > threshold
 
     # Filter boxes and labels using the keep mask.
     boxes  = outputs["pred_boxes"][0, keep]     # (N_kept, 4)
     labels = probas[keep].argmax(-1)            # (N_kept,)
 
-    print(f"Detections above threshold: {keep.sum().item()}")
-    print(boxes)
-    print(labels)
+    print(f"Detections above threshold ({threshold}): {keep.sum().item()}")
+    if keep.sum().item() == 0:
+        print(f"Top 5 confidence scores: {max_probs.topk(min(5, len(max_probs))).values.tolist()}")
+    else:
+        print(f"Boxes: {boxes}")
+        print(f"Labels: {labels}")
 
     if display:
         plt.figure(figsize=(10, 10))
-        img = image_tensor.permute(1, 2, 0).cpu().numpy()
+        
+        # Denormalize for display (reversing ImageNet normalization)
+        # mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1).to(image_tensor.device)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1).to(image_tensor.device)
+        img_display = image_tensor * std + mean
+        img_display = img_display.clamp(0, 1)
+        
+        img = img_display.permute(1, 2, 0).cpu().numpy()
         plt.imshow(img)
         ax = plt.gca()
 
