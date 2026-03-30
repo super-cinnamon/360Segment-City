@@ -131,8 +131,13 @@ def load_bdd100k_data(image_dir: str, label_path: str):
         with open(label_path, "r") as f:
             data = json.load(f)
         
-        # New format has a list of items under the "root" key.
-        for item in data.get("root", []):
+        # New format has a list of items directly or under the "root" key.
+        if isinstance(data, list):
+            items = data
+        else:
+            items = data.get("root", [])
+
+        for item in items:
             img_name = item.get("name", "")
             path, ann = _process_label_data(image_dir, img_name, item)
             if path:
