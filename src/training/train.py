@@ -338,6 +338,41 @@ def pad_batch(images: list, patch_size: int = PATCH_SIZE, grid_size: int = 3):
     return batched_imgs
 
 
+def load_state_dict_flexible(model, state_dict, rank=0):
+    """
+    Robustly load a state_dict into a model, handling potential 'module.' prefixes
+    caused by DistributedDataParallel (DDP) or DataParallel wrappers.
+    """
+    model_state_dict = model.state_dict()
+    
+    # Check for prefix mismatch
+    has_module_in_ckpt = any(k.startswith("module.") for k in state_dict.keys())
+    has_module_in_model = any(k.startswith("module.") for k in model_state_dict.keys())
+    
+    if has_module_in_ckpt and not has_module_in_model:
+        # Strip module. from checkpoint
+        state_dict = {k[7:] if k.startswith("module.") else k: v for k, v in state_dict.items()}
+        if rank == 0:
+            print("  → Stripped 'module.' prefix from checkpoint keys to match model.")
+    elif has_module_in_model and not has_module_in_ckpt:
+        # Add module. to checkpoint
+        state_dict = {"module." + k: v for k, v in state_dict.items()}
+        if rank == 0:
+            print("  → Added 'module.' prefix to checkpoint keys to match model.")
+
+    # Load with non-strict mode to handle minor mismatches gracefully if needed
+    # but we will report what we found.
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    
+    if rank == 0:
+        if len(missing) > 0:
+            print(f"  → Warning: Missing {len(missing)} keys in checkpoint.")
+        if len(unexpected) > 0:
+            print(f"  → Warning: Unexpected {len(unexpected)} keys in checkpoint.")
+            
+    return missing, unexpected
+
+
 # ---------------------------------------------------------------------------
 
 def train_plain_detr(
@@ -390,7 +425,9 @@ def train_plain_detr(
             print(f"[Resume] Loading checkpoint: {checkpoint_file}")
         # map_location ensures parameters are loaded to the correct device
         checkpoint = torch.load(checkpoint_file, map_location=device)
-        model.load_state_dict(checkpoint["model_state_dict"])
+        
+        state_dict = checkpoint["model_state_dict"]
+        load_state_dict_flexible(model, state_dict, rank=rank)
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         start_epoch = checkpoint["epoch"] + 1
         if rank == 0:
@@ -531,5 +568,11 @@ def save_checkpoint(model, path, epoch):
     if not os.path.exists(path):
         os.makedirs(path)
     save_path = os.path.join(path, f"plain_detr_epoch_{epoch}.pth")
-    torch.save(model.state_dict(), save_path)
+    
+    # If the model is wrapped in DDP, save the underlying module to avoid 'module.' prefix
+    # this makes the checkpoint easier to load for inference.
+    if hasattr(model, "module"):
+        torch.save(model.module.state_dict(), save_path)
+    else:
+        torch.save(model.state_dict(), save_path)
     print(f"[Checkpoint] Model state saved to {save_path}")
