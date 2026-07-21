@@ -9,3 +9,4 @@ pillow
 opencv-python
 ultralytics
 matplotlib
+py360convert
