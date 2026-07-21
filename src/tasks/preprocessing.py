@@ -4,13 +4,14 @@ from pathlib import Path
 import cv2
 import numpy as np
 from tqdm import tqdm
+import py360convert
 
 
 def load_video():
     pass
 
 
-def split_frames(video_path, threshold=2.0, max_to_extract=500):
+def split_frames(video_path, threshold=2.0, max_to_extract=5000):
     cap = cv2.VideoCapture(video_path)
     unique_frames = []
     last_frame_gray = None
@@ -37,6 +38,34 @@ def split_frames(video_path, threshold=2.0, max_to_extract=500):
     cap.release()
     print(f"Extracted {len(unique_frames)} unique frames into memory.")
     return unique_frames
+
+
+def generate_cubic(frames, face_w=512):
+    """Converts a list of 360/equirectangular frame images (NumPy arrays)
+
+    into a dictionary containing 'left', 'right', 'front', and 'back' face lists.
+    """
+    cubic_frames = {
+        "left": [],
+        "right": [],
+        "front": [],
+        "back": [],
+    }
+
+    for frame in frames:
+        # e2c returns a dictionary with keys: 'F', 'R', 'B', 'L', 'U', 'D'
+        cube_dict = py360convert.e2c(
+            frame, cube_format="dict", face_w=face_w, mode="bilinear"
+        )
+
+        cubic_frames["front"].append(cube_dict["F"])
+        cubic_frames["right"].append(cube_dict["R"])
+        cubic_frames["back"].append(cube_dict["B"])
+        cubic_frames["left"].append(cube_dict["L"])
+    # erase original equirectangular frames from memory
+    del frames
+
+    return cubic_frames
 
 
 def load_frames():

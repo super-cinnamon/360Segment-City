@@ -12,5 +12,8 @@ def load_config(config_path):
 
 CONFIG = load_config(os.path.join(os.path.dirname(__file__), "config.json"))
 
+with open(os.path.join(os.path.dirname(__file__), "environment_prompt.md"), "r") as f:
+    ENV_PROMPT = f.read()
+
 # check device
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
