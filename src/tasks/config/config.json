@@ -11,7 +11,7 @@
     },
     "segmentation": {
         "model_name": "shi-labs/oneformer_cityscapes_swin_large",
-        "task": "instance"
+        "task": "panoptic"
     },
     "vlm": {
         "model_name": "gemma4:e2b",
