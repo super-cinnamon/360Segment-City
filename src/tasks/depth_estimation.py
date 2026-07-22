@@ -29,6 +29,15 @@ def load_pipeline(
 depth_estimation_pipeline = load_pipeline()
 
 
+def normalize_depth(depth_map):
+    # Normalize depth map to [0, 1]
+    depth_min = np.min(depth_map)
+    depth_max = np.max(depth_map)
+    normalized_depth = (depth_map - depth_min) / (depth_max - depth_min + 1e-8)  # Add small epsilon to avoid division by zero
+
+    return normalized_depth
+
+
 def predict_depth(image, pipe=depth_estimation_pipeline, hyperparameters=CONFIG["depth_estimation"]["hyperparameters"]):
     # make image into PIL Image
     input_image = Image.fromarray(image)
@@ -50,20 +59,22 @@ def predict_depth(image, pipe=depth_estimation_pipeline, hyperparameters=CONFIG[
         depth_pred: np.ndarray = pipeline_output.depth_np
         depth_colored: Image.Image = pipeline_output.depth_colored
 
-    return depth_colored
+    return depth_colored, depth_pred
 
 
 def predict_depths(images, pipe=depth_estimation_pipeline, hyperparameters=CONFIG["depth_estimation"]["hyperparameters"]):
     depth_output_images = []
+    depth_output_predictions = []
     with torch.no_grad():
         for input_image in tqdm(images, desc=f"Estimating depth", leave=True):
             # Predict depth
-            depth_output_image = predict_depth(input_image, pipe, hyperparameters)
+            depth_output_image, depth_prediction = predict_depth(input_image, pipe, hyperparameters)
 
             # Save to the list
             depth_output_images.append(depth_output_image)
+            depth_output_predictions.append(depth_prediction)
 
-    return depth_output_images
+    return depth_output_images, depth_output_predictions
 
 
 def predict_cubic_depths(cubic_frames, pipe=depth_estimation_pipeline):
