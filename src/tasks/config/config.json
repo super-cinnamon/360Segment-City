@@ -32,7 +32,10 @@
             "16": "train",
             "17": "motorcycle",
             "18": "bicycle"
-        }
+        },
+        "relevant_labels": ["1", "4", "11", "12", "13", "14", "15", "17", "18"],
+        "score_threshold": 0.8,
+        "depth_threshold": 0.9
     },
     "vlm": {
         "model_name": "gemma4:e2b",

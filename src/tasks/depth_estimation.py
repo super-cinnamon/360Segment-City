@@ -4,6 +4,7 @@ from PIL import Image
 from tqdm import tqdm
 import torch
 from diffusers import DiffusionPipeline
+from scipy import stats
 
 # for parallel processing
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -27,15 +28,6 @@ def load_pipeline(
 
 # load pipeline
 depth_estimation_pipeline = load_pipeline()
-
-
-def normalize_depth(depth_map):
-    # Normalize depth map to [0, 1]
-    depth_min = np.min(depth_map)
-    depth_max = np.max(depth_map)
-    normalized_depth = (depth_map - depth_min) / (depth_max - depth_min + 1e-8)  # Add small epsilon to avoid division by zero
-
-    return normalized_depth
 
 
 def predict_depth(image, pipe=depth_estimation_pipeline, hyperparameters=CONFIG["depth_estimation"]["hyperparameters"]):
@@ -128,3 +120,21 @@ def get_closest_depth_mask(depth_images, threshold=10):
         combined_mask = cv2.dilate(combined_mask, kernel, iterations=2)
     
     return combined_mask
+
+
+def mode_depth(depth_map, segmentation_mask):
+    # Ensure your mask is a boolean array (True for object pixels, False for background)
+    binary_mask = segmentation_mask > 0
+
+    # Filter depth map using the mask (returns a 1D array of depth values)
+    object_depths = depth_map[binary_mask]
+
+    # Round to discrete levels so identical float values can group up for a mode calculation
+    binned_depths = np.round(object_depths, decimals=2)
+
+    # Get the mode depth of the object
+    mode_depth = stats.mode(binned_depths, keepdims=False).mode
+
+
+    return mode_depth
+
