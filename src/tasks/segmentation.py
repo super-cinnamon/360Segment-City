@@ -29,10 +29,16 @@ def predict_segmentation(image, processor, model, task=CONFIG["segmentation"]["t
     # pass through image_processor for postprocessing
     if task == "semantic":
         predicted_map = processor.post_process_semantic_segmentation(outputs, target_sizes=[image.shape[:2]])[0]
+        predicted_labels = None
     if task == "instance":
-        predicted_map = processor.post_process_instance_segmentation(outputs, target_sizes=[image.shape[:2]])[0]["segmentation"]
+        results = processor.post_process_instance_segmentation(outputs, target_sizes=[image.shape[:2]])[0]
+        predicted_map = results["segmentation"]
+        predicted_labels = results["segments_info"]
+
     if task == "panoptic":
-        predicted_map = processor.post_process_panoptic_segmentation(outputs, target_sizes=[image.shape[:2]])[0]["segmentation"]
+        results = processor.post_process_panoptic_segmentation(outputs, target_sizes=[image.shape[:2]])[0]
+        predicted_map = results["segmentation"]
+        predicted_labels = results["segments_info"]
 
     predicted_map = predicted_map.cpu().numpy()
 
@@ -45,7 +51,10 @@ def predict_segmentation(image, processor, model, task=CONFIG["segmentation"]["t
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    return predicted_map
+    return {
+        "segmentation_map": predicted_map,
+        "segmentation_labels": predicted_labels,
+    }
 
 
 def predict_segmentations(images, processor, model, task=CONFIG["segmentation"]["task"]):

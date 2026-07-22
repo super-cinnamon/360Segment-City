@@ -11,6 +11,8 @@ from src.tasks.depth_estimation import (
 )
 from src.tasks.segmentation import predict_segmentations, predict_cubic_segmentations
 
+from src.tasks.config.utils import CONFIG
+
 class VideoLoader:
     def __init__(self, video_path):
         self.video_path = video_path
@@ -46,7 +48,12 @@ class VideoProcessor:
     def segment(self, object_name=None):
         # for this model there is no object name so we ignore for now
         if self.cubic:
-            frames = self.cubic_frames[-5:]  # Get the last 5 frames, remove later
+            frames = self.cubic_frames
+            frames["front"] = frames["front"][-5:]  # Get the last 5 frames, remove later
+            frames["right"] = frames["right"][-5:]  # Get the last 5 frames, remove later
+            frames["back"] = frames["back"][-5:]  # Get the last 5 frames, remove later
+            frames["left"] = frames["left"][-5:]  # Get the last 5 frames, remove later
+
             segmentation_masks = predict_cubic_segmentations(frames)
             return segmentation_masks
         frames = self.video_loader.frames
@@ -75,6 +82,23 @@ class SegmentationPipeline:
         segmentation_masks = self.video_processor.segment(object_name)
         # create the list of segmented items with their class names and which frame they belong to
         segmented_items = []
-
-        cleaned_segmentation_masks = self.video_processor.clean_segmentation(depth_masks, segmentation_masks)
-        return cleaned_segmentation_masks
+        for i in range (len(segmentation_masks["front"])): # looping through frames
+            frame_segments = []
+            for key in segmentation_masks.keys():  # looping through sides
+                for segment_info in segmentation_masks[key][i]["segmentation_labels"]:  # loop through segmented items
+                    # Retrieve human-readable class name from model's id2label mapping
+                    class_name = CONFIG["segmentation"]["id2label"].get(str(segment_info["label_id"]), f"Class_{segment_info['label_id']}")
+                    binary_mask = (segmentation_masks[key][i]["segmentation_map"] == segment_info["id"])
+                    frame_segments.append({
+                        "frame": i,
+                        "side": key,
+                        "class_name": class_name,
+                        "class_id": segment_info["label_id"],
+                        "score": segment_info.get("score", None),
+                        "was_fused": segment_info.get("was_fused", False),
+                        "mask": binary_mask
+                    })
+            segmented_items.append(frame_segments)
+                       
+        # cleaned_segmentation_masks = self.video_processor.clean_segmentation(depth_masks, segmentation_masks)
+        return segmented_items

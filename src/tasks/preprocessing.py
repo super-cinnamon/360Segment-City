@@ -11,7 +11,7 @@ def load_video():
     pass
 
 
-def split_frames(video_path, threshold=2.0, max_to_extract=5000):
+def split_frames(video_path, threshold=2.0, max_to_extract=1500):
     cap = cv2.VideoCapture(video_path)
     unique_frames = []
     last_frame_gray = None
