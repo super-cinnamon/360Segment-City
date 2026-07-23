@@ -1,5 +1,6 @@
 # for parallel processing
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional
 from src.tasks.preprocessing import (
     load_cubic,
     split_frames,
@@ -11,8 +12,14 @@ from src.tasks.depth_estimation import (
     mode_depth,
 )
 from src.tasks.segmentation import predict_segmentations, predict_cubic_segmentations
+from src.tasks.environment import query_world_model
+from src.tasks.risk_assessment import (
+    RiskAssessmentEngine,
+    TelemetryData,
+    compute_depth_bounds,
+)
 
-from src.tasks.config.utils import CONFIG
+from src.tasks.config.utils import CONFIG, ENV_PROMPT
 
 class VideoLoader:
     def __init__(self, video_path):
@@ -116,7 +123,7 @@ class SegmentationPipeline:
 
         return segmented_items
 
-    def process(self, object_name=None):
+    def process_vision(self, object_name=None):
         depth_masks = self.video_processor.get_depth_mask()
         segmentation_masks = self.video_processor.segment(object_name)
         # create the list of segmented items with their class names and which frame they belong to
@@ -147,3 +154,85 @@ class SegmentationPipeline:
         segmented_items = self.prune_depth(segmented_items)         
       
         return segmented_items
+
+    def process_environment(self, prompt: str = ENV_PROMPT) -> str:
+        """
+        Produces a structured environment description for the current video clip
+        by querying the world model (environment.py) on the front-facing frames.
+
+        The front camera is used because it provides the rider's primary field of
+        view and is the most relevant for detecting road conditions, traffic signs,
+        and weather. The description is a single string (structured JSON from the
+        VLM) that is shared across all frames when calling process_risk().
+
+        Args:
+            prompt: VLM prompt to use. Defaults to ENV_PROMPT from the config.
+
+        Returns:
+            Environment description string (structured JSON from the world model).
+        """
+        if self.video_processor.cubic:
+            # Use front-facing cubic frames for the environment description
+            front_frames = self.video_processor.cubic_frames["front"]
+        else:
+            front_frames = self.video_loader.frames
+
+        env_description = query_world_model(
+            prompt=prompt,
+            images=front_frames,
+            model=CONFIG["vlm"]["world_model"]["model_name"],
+        )
+
+        # query_world_model returns a string (Windows) or list of strings (Linux/vLLM);
+        # normalise to a single string in both cases.
+        if isinstance(env_description, list):
+            env_description = "\n".join(env_description)
+
+        return env_description
+
+    def process_risk(
+        self,
+        segmented_items: list[list[dict]],
+        env_description: str,
+        telemetry: Optional[TelemetryData] = None,
+        api_base: str = CONFIG["risk_assessment"]["api_base"],
+        model_name: str = CONFIG["risk_assessment"]["model_name"],
+    ) -> list[dict]:
+        """
+        Runs G-Eval risk assessment for every frame in segmented_items.
+
+        Args:
+            segmented_items:  Output of SegmentationPipeline.process_vision().
+                              A list of frames, where each frame is a list of
+                              segment dicts (class_name, mode_depth, mask, …).
+            env_description:  Structured environment description string produced
+                              by query_world_model() / query_ollama_vlm() in
+                              environment.py.
+            telemetry:        Optional TelemetryData from physics/IMU sensors.
+                              Pass None (default) when no sensor data is available.
+            api_base:         Base URL of the vLLM-compatible API server.
+            model_name:       Name of the model hosted by the API server.
+
+        Returns:
+            List of G-Eval result dicts (one per frame), each containing:
+                - "expected_risk_score" : float in [1, 3]
+                - "score_probabilities" : {1: float, 2: float, 3: float}
+                - "context_summary"     : metadata dict
+        """
+        engine = RiskAssessmentEngine(api_base=api_base, model_name=model_name)
+
+        # Compute global depth bounds across all frames for consistent normalization
+        depth_min, depth_max = compute_depth_bounds(segmented_items)
+
+        risk_results = []
+        for frame_segments in segmented_items:
+            result = engine.assess_frame(
+                frame_segments=frame_segments,
+                env_description=env_description,
+                telemetry=telemetry,
+                depth_min=depth_min,
+                depth_max=depth_max,
+            )
+            risk_results.append(result)
+
+        return risk_results
