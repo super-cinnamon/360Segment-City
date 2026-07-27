@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 
 from src.tasks.config.utils import CONFIG
+from src.tasks.environment import load_world_model
 
 is_windows = sys.platform.startswith('win')
 
@@ -25,41 +26,24 @@ class ChatMessage(BaseModel):
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: List[ChatMessage]
-    temperature: Optional[float] = 0.2
-    max_tokens: Optional[int] = 512
+    temperature: Optional[float] = 0.5
+    max_tokens: Optional[int] = 1024
     logprobs: Optional[bool] = False
-    top_logprobs: Optional[int] = 5
+    top_logprobs: Optional[int] = 10
 
 # ---------------------------------------------------------------------------
 # 2. Windows HF Model Initializer & Inference Function
 # ---------------------------------------------------------------------------
-def load_hf_model(model_name: str):
-    if "model" not in MODEL_CONTAINER:
-        from transformers import AutoProcessor, AutoModelForImageTextToText
-        
-        print(f"[Windows HF Server] Loading model {model_name}...")
-        processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
-        model = AutoModelForImageTextToText.from_pretrained(
-            model_name,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-            trust_remote_code=True
-        )
-        model.eval()
-        MODEL_CONTAINER["model"] = model
-        MODEL_CONTAINER["processor"] = processor
-        MODEL_CONTAINER["tokenizer"] = processor.tokenizer
-    return MODEL_CONTAINER["model"], MODEL_CONTAINER["processor"], MODEL_CONTAINER["tokenizer"]
-
 
 @app.post("/v1/chat/completions")
 async def create_chat_completion(request: ChatCompletionRequest):
-    if not is_windows:
-        raise HTTPException(status_code=400, detail="Use native vLLM entrypoint on Linux.")
+    # if not is_windows:
+    #     raise HTTPException(status_code=400, detail="Use native vLLM entrypoint on Linux.")
 
-    model, processor, tokenizer = load_hf_model(request.model)
+    model, processor, tokenizer = load_world_model(request.model)
 
     # Format OpenAI messages for HuggingFace chat template
+    # Maybe use the already existing implementation on src
     formatted_messages = []
     for msg in request.messages:
         formatted_messages.append({"role": msg.role, "content": msg.content})
@@ -133,15 +117,15 @@ async def create_chat_completion(request: ChatCompletionRequest):
 # ---------------------------------------------------------------------------
 # 3. Main Launch Method
 # ---------------------------------------------------------------------------
-def run_server(host="0.0.0.0", port=8000, model_name=CONFIG["vlm"]["world_model"]["model_name"]):
-    if is_windows:
-        print("[Launcher] Windows detected. Launching FastAPI/HF local API server...")
-        # Pre-load model
-        load_hf_model(model_name)
-        uvicorn.run(app, host=host, port=port)
-    else:
-        print("[Launcher] Linux detected. Launch vLLM using terminal command:")
-        print(f"python -m vllm.entrypoints.openai.api_server --model {model_name} --port {port}")
+def run_server(host="0.0.0.0", port=5015, model_name=CONFIG["vlm"]["world_model"]["model_name"]):
+    # if is_windows:
+    print("[Launcher] Windows detected. Launching FastAPI/HF local API server...")
+    # Pre-load model
+    load_world_model(model_name)
+    uvicorn.run(app, host=host, port=port)
+    # else:
+    #     print("[Launcher] Linux detected. Launch vLLM using terminal command:")
+    #     print(f"python -m vllm.entrypoints.openai.api_server --model {model_name} --port {port}")
 
 if __name__ == "__main__":
-    run_server(port=8000)
+    run_server(port=5015)

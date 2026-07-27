@@ -33,7 +33,7 @@
             "17": "motorcycle",
             "18": "bicycle"
         },
-        "relevant_labels": ["1", "4", "11", "12", "13", "14", "15", "17", "18"],
+        "relevant_labels": [1, 4, 11, 12, 13, 14, 15, 17, 18],
         "score_threshold": 0.8,
         "depth_threshold": 0.9
     },
@@ -48,7 +48,8 @@
         }
     },
     "risk_assessment": {
-        "api_base": "http://localhost:8000/v1",
-        "model_name": "nvidia/Cosmos3-Edge"
+        "api_base": "http://localhost:5015/v1",
+        "model_name": "nvidia/Cosmos3-Edge",
+        "epoch_window_size": 50
     }
-}
+}

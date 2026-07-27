@@ -10,5 +10,6 @@ opencv-python
 ultralytics
 matplotlib
 py360convert
+ollama
 vllm
 uvloop
