@@ -11,7 +11,7 @@ def load_video():
     pass
 
 
-def split_frames(video_path, threshold=2.0, max_to_extract=1500):
+def split_frames(video_path, threshold=2.0, max_to_extract=2000):
     cap = cv2.VideoCapture(video_path)
     unique_frames = []
     last_frame_gray = None
@@ -38,6 +38,58 @@ def split_frames(video_path, threshold=2.0, max_to_extract=1500):
     cap.release()
     print(f"Extracted {len(unique_frames)} unique frames into memory.")
     return unique_frames
+
+
+def split_frames_window(video_path, start_frame=0, threshold=2.0, max_to_extract=2000):
+    """
+    Reads a video starting at `start_frame` (0-based raw frame index) and
+    extracts up to `max_to_extract` unique frames using the same uniqueness
+    thresholding logic as `split_frames`.
+
+    Returns a tuple `(unique_frames, last_raw_index)` where `last_raw_index` is
+    the last raw frame index read from the video (0-based). If EOF is reached
+    immediately, returns ([], None).
+    """
+    cap = cv2.VideoCapture(video_path)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    if start_frame >= total_frames:
+        cap.release()
+        return [], None
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+    unique_frames = []
+    last_frame_gray = None
+    last_raw_index = start_frame - 1
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        last_raw_index += 1
+
+        if len(unique_frames) >= max_to_extract:
+            break
+
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        if last_frame_gray is None:
+            is_different = True
+        else:
+            mse = np.mean((gray_frame.astype("float") - last_frame_gray.astype("float")) ** 2)
+            is_different = mse > threshold
+
+        if is_different:
+            unique_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            last_frame_gray = gray_frame
+
+    cap.release()
+    if unique_frames:
+        print(f"Window start={start_frame}: extracted {len(unique_frames)} unique frames (last_raw_index={last_raw_index})")
+        return unique_frames, last_raw_index
+    else:
+        return [], None
 
 
 def generate_cubic(frames, face_w=512):
