@@ -382,9 +382,8 @@ def _build_scene_block(
 
 def _build_reason_prompt(scene_block: str) -> str:
     """
-    Step 1 prompt — asks the model to produce ONE focused risk-interpretation
-    (a "reason") for this epoch/scene.  This prompt is called N times independently
-    with temperature > 0 so each call explores a different angle of risk.
+    Step 1 prompt — asks the model to produce ONE focused, polar risk-interpretation
+    by analyzing physical safety margins (TTC, proximity) and counterfactuals.
     """
     criteria_text = "\n".join(
         f"  {i+1}. {name}: {desc}"
@@ -392,48 +391,57 @@ def _build_reason_prompt(scene_block: str) -> str:
     )
 
     return (
-        "You are a road-safety expert evaluating risk for a motorcycle rider "
-        "equipped with a 360° camera system.\n\n"
-        "=== TASK INTRODUCTION ===\n"
-        "Assess the immediate safety risk to the rider based on the temporal scene data "
-        "below over the epoch window.  The overall risk score will range from 1 (Minimal Risk) to 5 (Severe Risk).\n\n"
+        "You are an expert road-safety auditor evaluating crash risk for a motorcycle rider "
+        "equipped with a 360° perception system.\n\n"
+        "=== TASK OVERVIEW ===\n"
+        "Analyze the temporal scene data below. Your goal is to identify the SINGLE MOST "
+        "critical risk trajectory or confirm the complete absence of physical hazards.\n\n"
         "=== EVALUATION CRITERIA ===\n"
         f"{criteria_text}\n\n"
         "=== SCENE DATA (EPOCH BATCH) ===\n"
         f"{scene_block}\n\n"
-        "=== YOUR TASK ===\n"
-        "Write ONE concise risk interpretation (2-4 sentences) of this epoch scene window. "
-        "Focus on the single most salient risk factor or trajectory trend you observe — reference "
-        "specific agent tracks, depth values, proximity percentages, or environment "
-        "features.  Do NOT assign a score yet.\n\n"
-        "Risk interpretation:"
+        "=== MANDATORY ANALYSIS STEPS ===\n"
+        "1. KINEMATIC CHECK: Identify the minimum Time-To-Collision (TTC), sudden deceleration/acceleration "
+        "   (>3 m/s²), or aggressive lateral shifts (cut-ins/encroachments) across all agent tracks.\n"
+        "2. COUNTERFACTUAL BOUNDARY TEST:\n"
+        "   - Is this scenario SAFE (Minimal Risk)? Explain why no agent trajectory intersects or threatens the rider.\n"
+        "   - OR is this scenario CRITICAL (High/Severe Risk)? Explain what immediate evasive action or physical "
+        "     hazard pushes this beyond routine driving.\n"
+        "3. POLARITY FOCUS: Do NOT summarize the scene as 'mildly cautious' or 'moderate.' Take a definitive stand "
+        "   on whether the scene leans clearly safe or clearly hazardous based on physical spatial margins.\n\n"
+        "=== OUTPUT INSTRUCTIONS ===\n"
+        "Write 1 concise risk interpretation (3-4 sentences). Reference specific track IDs, exact depth/distance "
+        "values, and velocity/TTC figures. Do NOT assign a score number.\n\n"
+        "Risk Interpretation:"
     )
 
 
 def _build_scoring_prompt(scene_block: str, reason: str) -> str:
     """
-    Step 2 prompt — the G-VEval form-filling prompt.
-    Injects ONE specific reason (from Step 1) together with the scene data and
-    rubric, then constrains the model to output a single score digit so that
-    log-probabilities over {1, 2, 3} can be extracted.
-
-    Args
-    ----
-    scene_block : assembled scene context (from _build_scene_block).
-    reason      : a single risk interpretation produced in Step 1.
+    Step 2 prompt — Enforces strict score mapping using physical thresholds (TTC, hard maneuvers)
+    and explicit rubric boundaries to prevent central tendency bias.
     """
     return (
-        "You are a road-safety expert evaluating risk for a motorcycle rider "
-        "equipped with a 360° camera system.\n\n"
+        "You are a strict motorcycle risk scoring model. Evaluate the scene data and risk interpretation "
+        "and assign an exact risk score from 1 to 5.\n\n"
         "=== SCENE DATA ===\n"
         f"{scene_block}\n\n"
         "=== RISK INTERPRETATION ===\n"
         f"{reason.strip()}\n\n"
-        "=== SCORE RUBRIC ===\n"
-        f"{SCORE_RUBRIC}\n\n"
-        "Given the risk interpretation above and the scene data, assign a single "
-        "overall risk score.  "
-        "Output ONLY a single digit 1, 2, 3, 4, or 5 — no words, no punctuation.\n"
+        "=== RIGID ANCHOR RUBRIC ===\n"
+        "Assign the score based strictly on these physical hazard anchors:\n"
+        "• 1 (Minimal Risk): Free flow traffic, clear spatial buffers (>5s TTC), standard cruising. No threat.\n"
+        "• 2 (Low Risk): Minor density or routine speed adjustments. Normal awareness required; no path conflicts.\n"
+        "• 3 (Moderate Risk): Noticeable interaction (TTC 3-5s), gradual deceleration ahead, or mild lateral encroachment. "
+        "  *ONLY use 3 if physical metrics strictly fall in this middle zone.*\n"
+        "• 4 (High Risk): Abrupt hazard, hard braking (>3 m/s²), aggressive cut-in, or severe buffer loss (TTC 2-3s). "
+        "  Rider must actively adjust trajectory/speed.\n"
+        "• 5 (Severe / Critical Risk): Immediate collision threat or trajectory overlap (TTC < 2s). Emergency evasive "
+        "  action (hard braking/swerving) is required to avoid a crash.\n\n"
+        "=== SCORING RULES ===\n"
+        "1. Do NOT default to 3 out of caution. If there is low interaction, score 1 or 2. If there is a close cut-in or hard brake, score 4 or 5.\n"
+        "2. If TTC < 2 seconds or a direct trajectory conflict exists, you MUST score 4 or 5.\n\n"
+        "Output ONLY a single digit integer (1, 2, 3, 4, or 5) corresponding to the risk score.\n"
         "Score:"
     )
 
