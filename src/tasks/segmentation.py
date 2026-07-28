@@ -64,7 +64,7 @@ def predict_segmentations(images, processor, model, task=CONFIG["segmentation"][
         results.append(result)
     return results
 
-
+# ? while effective, requires way too much vram and processing power
 def predict_cubic_segmentations(cubic_frames, processor=segmentation_processor, model=segmentation_model):
     # parallel process all of the sides and recompile them into a list of dicts
     # use ThreadPoolExecutor

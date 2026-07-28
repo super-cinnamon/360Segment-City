@@ -379,7 +379,7 @@ def _build_scene_block(
         f"[Physical Telemetry]\n{telemetry_block}"
     )
 
-
+# * risk reasoning prompt
 def _build_reason_prompt(scene_block: str) -> str:
     """
     Step 1 prompt — asks the model to produce ONE focused, polar risk-interpretation
@@ -415,7 +415,7 @@ def _build_reason_prompt(scene_block: str) -> str:
         "Risk Interpretation:"
     )
 
-
+# * risk scoring prompt
 def _build_scoring_prompt(scene_block: str, reason: str) -> str:
     """
     Step 2 prompt — Enforces strict score mapping using physical thresholds (TTC, hard maneuvers)

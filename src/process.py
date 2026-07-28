@@ -31,14 +31,14 @@ class VideoLoader:
     def load_cubic(self):  # ! to double check, need cubic generator function
         return load_cubic(self.video_path)
     
-    def generate_cubic(self, frames):
+    def generate_cubic(self, frames):  
         return generate_cubic(frames)
 
-    def get_split_frames(self, max_to_extract=2000):
+    def get_split_frames(self, max_to_extract=2000):  # * if you'd like to only work on a sample, slice this list
         # Backwards-compatible helper that returns up to `max_to_extract` unique frames
         # starting at the beginning of the video.
         self.frames = split_frames(self.video_path, max_to_extract)
-        return self.frames
+        return self.frames  # [100:200]
 
     def get_frames_window(self, start_frame: int = 0, max_to_extract: int = 2000, threshold: float = 2.0):
         # New helper: returns (frames_list, last_raw_index) for a window starting
@@ -152,7 +152,7 @@ class SegmentationPipeline:
                     class_name = CONFIG["segmentation"]["id2label"].get(str(segment_info["label_id"]), f"Class_{segment_info['label_id']}")
                     binary_mask = (segmentation_masks[key][i]["segmentation_map"] == segment_info["id"])
                     # calculate the mode of the depth for this object
-                    mode_depth_value = mode_depth(depth_masks[key][1][i], binary_mask)
+                    mode_depth_value = mode_depth(depth_masks[key][1][i], binary_mask) # ! this part needs to be switched to take more frames not just current
                     frame_segments.append({
                         "frame": i,
                         "side": key,
@@ -171,6 +171,7 @@ class SegmentationPipeline:
       
         return segmented_items
 
+    # * is the same as the function i wrote above, but just takes specific frames as input, above function will be removed later
     def process_vision_for(self, frames, object_name=None):
         """
         Process a provided list of frames (or cubic dict) and return segmented items.
@@ -212,6 +213,7 @@ class SegmentationPipeline:
         segmented_items = self.prune_depth(segmented_items)
         return segmented_items
 
+    # * here is where the environment description is generated, the detected static elements will be added here next time
     def process_environment(self, prompt: str = ENV_PROMPT) -> str:
         """
         Produces a structured environment description for the current video clip
@@ -257,6 +259,7 @@ class SegmentationPipeline:
 
         return env_description
 
+    # * the full risk processing pipeline, using sliding window of 50 frames (assuming framerate of gopro is 50)
     def process_risk(
             self,
             segmented_items: list[list[dict]],
