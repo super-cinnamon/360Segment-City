@@ -19,6 +19,12 @@ from src.tasks.risk_assessment import (
     TelemetryData,
     compute_depth_bounds,
 )
+from src.tasks.roi import (
+    build_static_objects_summary,
+    format_static_objects_summary,
+    resize_frames,
+    should_process_window,
+)
 
 from src.tasks.config.utils import CONFIG, ENV_PROMPT
 
@@ -107,6 +113,28 @@ class SegmentationPipeline:
         self.video_loader = VideoLoader(video_path)
         self.video_processor = VideoProcessor(self.video_loader, cubic=cubic)
 
+    def _get_image_scale(self) -> float:
+        processing_cfg = CONFIG.get("processing", {})
+        image_scale = processing_cfg.get("image_scale", 1.0)
+        try:
+            image_scale = float(image_scale)
+        except (TypeError, ValueError):
+            image_scale = 1.0
+        return max(0.0, min(1.0, image_scale))
+
+    def _prepare_frames_for_inference(self, frames):
+        scale = self._get_image_scale()
+        if self.video_processor.cubic:
+            if isinstance(frames, dict):
+                cubic_frames = frames
+            else:
+                cubic_frames = self.video_loader.generate_cubic(frames)
+            return {
+                side: resize_frames(face_frames, scale=scale)
+                for side, face_frames in cubic_frames.items()
+            }
+        return resize_frames(frames, scale=scale)
+
     def prune_segmentation(
             self,
             items,
@@ -148,8 +176,12 @@ class SegmentationPipeline:
 
     def process_vision(self, object_name=None):
         # Backwards-compatible default behaviour (no frames provided): run as before
-        depth_masks = self.video_processor.get_depth_mask()
-        segmentation_masks = self.video_processor.segment(object_name)
+        if self.video_loader.frames is None:
+            self.video_loader.frames = self.video_loader.get_split_frames()
+
+        prepared_frames = self._prepare_frames_for_inference(self.video_loader.frames)
+        depth_masks = self.video_processor.get_depth_mask_for(prepared_frames)
+        segmentation_masks = self.video_processor.segment_for(prepared_frames, object_name)
         # create the list of segmented items with their class names and which frame they belong to
         segmented_items = []
         environment_items = []
@@ -183,21 +215,23 @@ class SegmentationPipeline:
         return segmented_items, environment_items
 
     # * is the same as the function i wrote above, but just takes specific frames as input, above function will be removed later
-    def process_vision_for(self, frames, object_name=None):
+    def process_vision_for(self, frames, object_name=None, prepared_frames=None):
         """
         Process a provided list of frames (or cubic dict) and return segmented items.
         This allows sliding-window processing without changing the core logic.
         """
+        if prepared_frames is None:
+            prepared_frames = self._prepare_frames_for_inference(frames)
+
         # compute depth masks and segmentation masks for provided frames
         if self.video_processor.cubic:
-            cubic_frames = self.video_loader.generate_cubic(frames)
-            depth_masks = self.video_processor.get_depth_mask_for(cubic_frames)
-            segmentation_masks = self.video_processor.segment_for(cubic_frames, object_name)
-            frames_front = cubic_frames["front"]
+            depth_masks = self.video_processor.get_depth_mask_for(prepared_frames)
+            segmentation_masks = self.video_processor.segment_for(prepared_frames, object_name)
+            frames_front = prepared_frames["front"]
         else:
-            depth_masks = self.video_processor.get_depth_mask_for(frames)
-            segmentation_masks = self.video_processor.segment_for(frames, object_name)
-            frames_front = frames
+            depth_masks = self.video_processor.get_depth_mask_for(prepared_frames)
+            segmentation_masks = self.video_processor.segment_for(prepared_frames, object_name)
+            frames_front = prepared_frames
 
         # create the list of segmented items with their class names and which frame they belong to
         segmented_items = []
@@ -232,37 +266,31 @@ class SegmentationPipeline:
         return segmented_items, environment_items
 
     # * here is where the environment description is generated, the detected static elements will be added here next time
-    def process_environment(self, static_objects, prompt: str = ENV_PROMPT) -> str:
-        # ! add the input of the static objects segmentation
-        """
-        Produces a structured environment description for the current video clip
-        by querying the world model (environment.py) on the front-facing frames.
-
-        The front camera is used because it provides the rider's primary field of
-        view and is the most relevant for detecting road conditions, traffic signs,
-        and weather. The description is a single string (structured JSON from the
-        VLM) that is shared across all frames when calling process_risk().
-
-        Args:
-            prompt: VLM prompt to use. Defaults to ENV_PROMPT from the config.
-
-        Returns:
-            Environment description string (structured JSON from the world model).
-        """
-        # Backwards-compatible behaviour: use preloaded cubic frames if present
-        if self.video_processor.cubic and self.video_processor.cubic_frames is not None:
-            front_frames = self.video_processor.cubic_frames["front"]
-        elif self.video_processor.cubic and self.video_loader.frames is not None:
-            front_frames = self.video_loader.generate_cubic(self.video_loader.frames)["front"]
+    def process_environment(self, static_objects=None, prompt: str = ENV_PROMPT) -> str:
+        # Backwards-compatible behaviour: use preloaded frames if present
+        if self.video_processor.cubic and self.video_loader.frames is not None:
+            frames = self.video_loader.frames
         elif not self.video_processor.cubic and self.video_loader.frames is not None:
-            front_frames = self.video_loader.frames
+            frames = self.video_loader.frames
         else:
             # No preloaded frames — fall back to loading up to 2000 frames from start
-            front_frames = self.video_loader.get_split_frames()
+            frames = self.video_loader.get_split_frames()
+
+        return self.process_environment_for(frames, static_objects=static_objects, prompt=prompt)
+
+    def process_environment_for(self, frames, static_objects=None, prompt: str = ENV_PROMPT, prepared_frames=None) -> str:
+        if prepared_frames is None:
+            prepared_frames = self._prepare_frames_for_inference(frames)
+
+        if self.video_processor.cubic:
+            front_frames = prepared_frames["front"]
+        else:
+            front_frames = prepared_frames
 
         # add static objects to prompt
+        static_objects_summary = static_objects if static_objects is not None else []
         resolved_prompt = prompt.format(
-            STATIC_OBJECTS=str(static_objects) if static_objects is not None else "[]"
+            STATIC_OBJECTS=format_static_objects_summary(static_objects_summary)
         )
 
         environment_descriptions = []
@@ -275,6 +303,9 @@ class SegmentationPipeline:
             )
             environment_descriptions.append(env_description)
 
+        if not environment_descriptions:
+            return ""
+
         # normalise to a single string in both cases.
         if isinstance(environment_descriptions[-1], list):
             env_description = "\n".join(environment_descriptions[-1])
@@ -282,6 +313,71 @@ class SegmentationPipeline:
             env_description = environment_descriptions[-1]
 
         return env_description
+
+    def process_window(
+            self,
+            frames,
+            object_name=None,
+            telemetry: Optional[TelemetryData] = None,
+            prompt: str = ENV_PROMPT,
+            roi_enabled: Optional[bool] = None,
+            roi_threshold: Optional[float] = None,
+    ) -> dict:
+        """Run ROI gating, environment description generation, segmentation, and risk assessment for one window."""
+        if roi_enabled is None:
+            roi_enabled = bool(CONFIG.get("processing", {}).get("roi_enabled", True))
+        if roi_threshold is None:
+            roi_threshold = float(CONFIG.get("processing", {}).get("roi_threshold", 0.75))
+
+        prepared_frames = self._prepare_frames_for_inference(frames)
+        environment_description = self.process_environment_for(
+            frames,
+            static_objects=None,
+            prompt=prompt,
+            prepared_frames=prepared_frames,
+        )
+
+        should_process = should_process_window(
+            environment_description,
+            roi_enabled=roi_enabled,
+            roi_threshold=roi_threshold,
+        )
+        if not should_process:
+            return {
+                "processed": False,
+                "environment_description": environment_description,
+                "segmented_items": [],
+                "environment_items": [],
+                "risk_result": None,
+                "reason": "skip_low_roi",
+            }
+
+        segmented_items, environment_items = self.process_vision_for(
+            frames,
+            object_name=object_name,
+            prepared_frames=prepared_frames,
+        )
+        static_objects = build_static_objects_summary(environment_items)
+        refined_environment_description = self.process_environment_for(
+            frames,
+            static_objects=static_objects,
+            prompt=prompt,
+            prepared_frames=prepared_frames,
+        )
+        risk_result = self.process_risk(
+            segmented_items,
+            refined_environment_description,
+            telemetry=telemetry,
+        )
+
+        return {
+            "processed": True,
+            "environment_description": refined_environment_description,
+            "segmented_items": segmented_items,
+            "environment_items": environment_items,
+            "risk_result": risk_result,
+            "reason": "processed",
+        }
 
     # * the full risk processing pipeline, using sliding window of 50 frames (assuming framerate of gopro is 50)
     def process_risk(

@@ -8,7 +8,7 @@ from src.tasks.environment import query_world_model
 from src.tasks.config.utils import ENV_PROMPT, CONFIG
 
 DATA_PATH = "data/GS010013.mp4"
-CHUNK_MAX_FRAMES = 2000
+CHUNK_MAX_FRAMES = 20
 OUTPUT_DIR = "data/outputs"
 DETAILED_OUT = os.path.join(OUTPUT_DIR, "risk_epochs_detailed.jsonl")
 SUMMARY_OUT = os.path.join(OUTPUT_DIR, "risk_epochs_summary.jsonl")
@@ -66,32 +66,16 @@ def main():
 
         print(f"Processing window {window_idx} raw_frames {start_raw}..{last_raw} (unique frames={len(frames)})")
 
-        # Process vision for this frame window
-        segmented_items = pipeline.process_vision_for(frames)
-
-        # Build environment description for the window
-        if pipeline.video_processor.cubic:
-            cubic = pipeline.video_loader.generate_cubic(frames)
-            front_frames = cubic["front"]
-        else:
-            front_frames = frames
-
-        # Query environment on front frames in groups of 10
-        env_description = ""
-        for i in range(0, len(front_frames), 10):
-            env_part = query_world_model(
-                prompt=ENV_PROMPT,
-                images=front_frames[i:i+10],
-                model=CONFIG["vlm"]["world_model"]["model_name"],
-            )
-            if isinstance(env_part, list):
-                env_part = "\n".join(env_part)
-            env_description += env_part + "\n"
-
-        env_description = env_description.strip()
-
-        # Assess risk for this window
-        epoch_results = pipeline.process_risk(segmented_items, env_description)
+        window_result = pipeline.process_window(
+            frames,
+            roi_enabled=CONFIG.get("processing", {}).get("roi_enabled", True),
+            roi_threshold=CONFIG.get("processing", {}).get("roi_threshold", 0.75),
+        )
+        env_description = window_result.get("environment_description", "")
+        segmented_items = window_result.get("segmented_items", [])
+        epoch_results = window_result.get("risk_result")
+        if epoch_results is None:
+            epoch_results = []
 
         # Normalise epoch_results to a list (process_risk may return dict or list)
         results_list = epoch_results if isinstance(epoch_results, list) else [epoch_results]
@@ -126,7 +110,7 @@ def main():
         if last_raw is None:  # * if you'd like to process only one window (epoch), force this break by uncommenting the comment after it
             break
 
-        # break
+        break
 
         # * if you'd like to run k epochs, change the k value and uncomment this comment
         # k = 5

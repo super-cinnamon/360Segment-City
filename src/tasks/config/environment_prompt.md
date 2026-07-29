@@ -39,6 +39,11 @@ Analyze the image carefully and output your response ONLY as a single, valid JSO
    - This list may be empty.
    - Static objects detected in the scene: {STATIC_OBJECTS}
 
+8. ENVIRONMENT_RISK_SCORE:
+   - Estimate the scene's immediate risk for the rider on a continuous scale from 0.0 to 1.0.
+   - Use 0.0 for very low-risk, clear-road scenes and 1.0 for very high-risk scenes.
+   - Consider traffic density, pedestrians, crossings, traffic signals, road complexity, weather, visibility, and proximity of nearby road users.
+
 ---
 
 ### Strict JSON Output Schema
@@ -55,5 +60,6 @@ Analyze the image carefully and output your response ONLY as a single, valid JSO
   },
   "weather_conditions": "clear_sunny | overcast_cloudy | rainy | foggy_hazy",
   "lighting_conditions": "daylight | dusk_dawn | night_well_lit | night_dark",
+  "environment_risk_score": 0.0,
   "confidence_notes": "Short string noting any ambiguity caused by glare, occlusion, or camera distortion (optional, keep under 15 words)."
 }

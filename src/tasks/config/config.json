@@ -48,6 +48,11 @@
             "temperature": 0.5
         }
     },
+    "processing": {
+        "roi_enabled": true,
+        "roi_threshold": 0.75,
+        "image_scale": 1.0
+    },
     "risk_assessment": {
         "api_base": "http://localhost:5015/v1",
         "model_name": "nvidia/Cosmos3-Edge",
