@@ -73,6 +73,7 @@ def load_world_model(model=CONFIG["vlm"]["world_model"]["model_name"]):
 
 # * here we query the world model to describe the environment, we will be adding the segmentation of the static objects in the prompt here, will be completed next time
 def query_world_model(prompt=ENV_PROMPT, images=[], model=CONFIG["vlm"]["world_model"]["model_name"]):
+    # ! add here the static objects from segmentation
     # Load the world model
     world_model = load_world_model(model=model)
 

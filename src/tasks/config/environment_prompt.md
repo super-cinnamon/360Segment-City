@@ -34,6 +34,11 @@ Analyze the image carefully and output your response ONLY as a single, valid JSO
    - Evaluate the primary ambient lighting environment.
    - Allowed values: "daylight", "dusk_dawn", "night_well_lit" (nighttime with functional streetlights), "night_dark" (nighttime with minimal/no artificial lighting).
 
+7. STATIC_OBJECTS_CONTEXT:
+   - The list below contains static objects detected from the segmentation stage.
+   - This list may be empty.
+   - Static objects detected in the scene: {STATIC_OBJECTS}
+
 ---
 
 ### Strict JSON Output Schema

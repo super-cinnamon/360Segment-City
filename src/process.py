@@ -107,7 +107,13 @@ class SegmentationPipeline:
         self.video_loader = VideoLoader(video_path)
         self.video_processor = VideoProcessor(self.video_loader, cubic=cubic)
 
-    def prune_segmentation(self, items, score_threshold=CONFIG["segmentation"]["score_threshold"], relevant_labels=CONFIG["segmentation"]["relevant_labels"]):
+    def prune_segmentation(
+            self,
+            items,
+            score_threshold=CONFIG["segmentation"]["score_threshold"],
+            dynamic_labels=CONFIG["segmentation"]["dynamic_labels"],
+            static_labels=CONFIG["segmentation"]["static_labels"]
+        ):
         """
         This method aims to prune out all segmentation masks that show a score below the given threshold.
         And also to prune out any label that is irrelevant to our needs. Both are given as input, and will 
@@ -117,10 +123,12 @@ class SegmentationPipeline:
 
         items = [
             item for item in items 
-            if item["score"] >= score_threshold and item["class_id"] in relevant_labels
+            if item["score"] >= score_threshold and item["class_id"] in dynamic_labels
         ]
 
-        return items
+        static_items = [item for item in items if item["class_id"] in static_labels]
+
+        return items, static_items
 
     def prune_depth(self, segmented_items, depth_threshold=CONFIG["segmentation"]["depth_threshold"]):
         for i, frame_segments in enumerate(segmented_items):
@@ -144,6 +152,7 @@ class SegmentationPipeline:
         segmentation_masks = self.video_processor.segment(object_name)
         # create the list of segmented items with their class names and which frame they belong to
         segmented_items = []
+        environment_items = []
         for i in range (len(segmentation_masks["front"])): # looping through frames
             frame_segments = []
             for key in segmentation_masks.keys():  # looping through sides
@@ -164,12 +173,14 @@ class SegmentationPipeline:
                         "mode_depth": mode_depth_value,
                     })
             # prune segmentation items based on score and relevant labels
-            frame_segments = self.prune_segmentation(frame_segments)
+            frame_segments, environment_segments = self.prune_segmentation(frame_segments)
             segmented_items.append(frame_segments)
+            environment_items.append(environment_segments)
         # prune segmentation items based on depth
         segmented_items = self.prune_depth(segmented_items)         
+        environment_items = self.prune_depth(environment_items)
       
-        return segmented_items
+        return segmented_items, environment_items
 
     # * is the same as the function i wrote above, but just takes specific frames as input, above function will be removed later
     def process_vision_for(self, frames, object_name=None):
@@ -190,13 +201,16 @@ class SegmentationPipeline:
 
         # create the list of segmented items with their class names and which frame they belong to
         segmented_items = []
-        for i in range(len(segmentation_masks["front"])): # looping through frames
+        environment_items = []
+        for i in range (len(segmentation_masks["front"])): # looping through frames
             frame_segments = []
             for key in segmentation_masks.keys():  # looping through sides
                 for segment_info in segmentation_masks[key][i]["segmentation_labels"]:  # loop through segmented items
+                    # Retrieve human-readable class name from model's id2label mapping
                     class_name = CONFIG["segmentation"]["id2label"].get(str(segment_info["label_id"]), f"Class_{segment_info['label_id']}")
                     binary_mask = (segmentation_masks[key][i]["segmentation_map"] == segment_info["id"])
-                    mode_depth_value = mode_depth(depth_masks[key][1][i], binary_mask)
+                    # calculate the mode of the depth for this object
+                    mode_depth_value = mode_depth(depth_masks[key][1][i], binary_mask) # ! this part needs to be switched to take more frames not just current
                     frame_segments.append({
                         "frame": i,
                         "side": key,
@@ -207,14 +221,19 @@ class SegmentationPipeline:
                         "mask": binary_mask,
                         "mode_depth": mode_depth_value,
                     })
-            frame_segments = self.prune_segmentation(frame_segments)
+            # prune segmentation items based on score and relevant labels
+            frame_segments, environment_segments = self.prune_segmentation(frame_segments)
             segmented_items.append(frame_segments)
-
-        segmented_items = self.prune_depth(segmented_items)
-        return segmented_items
+            environment_items.append(environment_segments)
+        # prune segmentation items based on depth
+        segmented_items = self.prune_depth(segmented_items)         
+        environment_items = self.prune_depth(environment_items)
+        
+        return segmented_items, environment_items
 
     # * here is where the environment description is generated, the detected static elements will be added here next time
-    def process_environment(self, prompt: str = ENV_PROMPT) -> str:
+    def process_environment(self, static_objects, prompt: str = ENV_PROMPT) -> str:
+        # ! add the input of the static objects segmentation
         """
         Produces a structured environment description for the current video clip
         by querying the world model (environment.py) on the front-facing frames.
@@ -241,11 +260,16 @@ class SegmentationPipeline:
             # No preloaded frames — fall back to loading up to 2000 frames from start
             front_frames = self.video_loader.get_split_frames()
 
+        # add static objects to prompt
+        resolved_prompt = prompt.format(
+            STATIC_OBJECTS=str(static_objects) if static_objects is not None else "[]"
+        )
+
         environment_descriptions = []
         # run environment by each 10 frames
         for i in range(0, len(front_frames), 10):  # ! implement tqdm later
             env_description = query_world_model(
-                prompt=prompt,
+                prompt=resolved_prompt,
                 images=front_frames[i:i+10],
                 model=CONFIG["vlm"]["world_model"]["model_name"],
             )
