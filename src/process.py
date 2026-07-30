@@ -26,7 +26,7 @@ from src.tasks.roi import (
     should_process_window,
 )
 
-from src.tasks.config.utils import CONFIG, ENV_PROMPT
+from src.tasks.config.utils import CONFIG, ENV_PROMPT, render_environment_prompt
 
 class VideoLoader:
     def __init__(self, video_path):
@@ -289,8 +289,9 @@ class SegmentationPipeline:
 
         # add static objects to prompt
         static_objects_summary = static_objects if static_objects is not None else []
-        resolved_prompt = prompt.format(
-            STATIC_OBJECTS=format_static_objects_summary(static_objects_summary)
+        resolved_prompt = render_environment_prompt(
+            prompt,
+            static_objects=static_objects_summary,
         )
 
         environment_descriptions = []
@@ -298,7 +299,7 @@ class SegmentationPipeline:
         for i in range(0, len(front_frames), 10):  # ! implement tqdm later
             env_description = query_world_model(
                 prompt=resolved_prompt,
-                images=front_frames[i:i+10],
+                images=front_frames[i:i+10],  # ! look into this
                 model=CONFIG["vlm"]["world_model"]["model_name"],
             )
             environment_descriptions.append(env_description)
@@ -314,7 +315,7 @@ class SegmentationPipeline:
 
         return env_description
 
-    def process_window(
+    def process_epoch(
             self,
             frames,
             object_name=None,
@@ -387,7 +388,6 @@ class SegmentationPipeline:
             telemetry: Optional[TelemetryData] = None,
             api_base: str = CONFIG["risk_assessment"]["api_base"],
             model_name: str = CONFIG["risk_assessment"]["model_name"],
-            epoch_window_size: Optional[int] = CONFIG["risk_assessment"].get("epoch_window_size", 50),
         ) -> list[dict] | dict:
             """
             Runs G-VEval risk assessment across the batch of frames as an "epoch" window.
@@ -415,20 +415,8 @@ class SegmentationPipeline:
                 n_reasons=int(CONFIG["risk_assessment"].get("n_reasons", 5)),
             )
 
-            if epoch_window_size and epoch_window_size < len(segmented_items):
-                epoch_results = []
-                for i in range(0, len(segmented_items), epoch_window_size):
-                    window = segmented_items[i : i + epoch_window_size]
-                    res = engine.assess_epoch(
-                        segmented_items=window,
-                        env_description=env_description,
-                        telemetry=telemetry,
-                    )
-                    epoch_results.append(res)
-                return epoch_results
-            else:
-                return engine.assess_epoch(
-                    segmented_items=segmented_items,
-                    env_description=env_description,
-                    telemetry=telemetry,
-                )
+            return engine.assess_epoch(
+                segmented_items=segmented_items,
+                env_description=env_description,
+                telemetry=telemetry,
+            )

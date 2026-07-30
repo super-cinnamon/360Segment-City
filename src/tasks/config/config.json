@@ -50,7 +50,7 @@
     },
     "processing": {
         "roi_enabled": true,
-        "roi_threshold": 0.75,
+        "roi_threshold": 0.7,
         "image_scale": 1.0
     },
     "risk_assessment": {
