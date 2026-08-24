@@ -30,6 +30,7 @@ References
 """
 
 import re
+import json
 import math
 import cv2
 import base64
@@ -404,9 +405,9 @@ def _build_reason_prompt(scene_block: str) -> str:
 
 def _build_synthesis_prompt(scene_block: str, reasons: list[tuple[str, float]]) -> str:
     """
-    Builds a prompt for the 'Smarter' scoring phase.
-    It presents all sampled reasons and asks the model to synthesize the most
-    physically grounded judgment to avoid central tendency bias (defaulting to 3).
+    Builds a prompt for the 'Hybrid' scoring phase.
+    It presents all sampled reasons and asks the model to judge and score each one
+    individually, allowing it to cross-reference and remove hallucinations.
     """
     reasons_list = "\n".join(
         f"Interpretation {i+1} (Confidence: {p:.2%}):\n{text}"
@@ -421,13 +422,12 @@ def _build_synthesis_prompt(scene_block: str, reasons: list[tuple[str, float]]) 
         "=== CANDIDATE INTERPRETATIONS ===\n"
         f"{reasons_list}\n\n"
         "=== SYNTHESIS TASK ===\n"
-        "1. EVALUATE: Compare the candidate interpretations. Identify which one most accurately "
-        "captures the physical hazards (proximity, TTC, trajectories). Discard any that are "
-        "too vague or ignore obvious dangers.\n"
-        "2. DECIDE: Based on the most grounded interpretation, determine the final risk score. "
-        "Strictly avoid the 'safe' middle-ground of 3 unless the physics strictly mandate it.\n"
-        "3. POLARIZE: If there is a clear hazard, push the score to 4 or 5. If the road is clear, "
-        "push the score to 1 or 2.\n\n"
+        "Your goal is to audit each candidate interpretation and assign it a risk score based on physical grounding.\n"
+        "1. EVALUATE: For each interpretation, determine if it is physically grounded in the scene data (e.g., correct TTC, proximity, track IDs).\n"
+        "2. CRITIQUE: Identify any hallucinations (claims about objects not present) or vagueness (generic terms without data).\n"
+        "3. SCORE: Assign a risk score (1-5) to each interpretation based on the most accurate physical hazards it identifies. "
+        "If an interpretation is a hallucination or totally vague, assign it a neutral score of 3.\n"
+        "4. POLARIZE: For grounded hazards, push the score to 4 or 5. For grounded clear roads, push to 1 or 2.\n\n"
         "=== RIGID ANCHOR RUBRIC ===\n"
         "• 1 (Minimal Risk): Free flow, buffers >5s TTC. No threat.\n"
         "• 2 (Low Risk): Routine adjustments, no path conflicts.\n"
@@ -435,12 +435,17 @@ def _build_synthesis_prompt(scene_block: str, reasons: list[tuple[str, float]]) 
         "• 4 (High Risk): Abrupt hazard, hard braking, TTC 2-3s. Active adjustment needed.\n"
         "• 5 (Severe Risk): Immediate collision threat, TTC < 2s. Emergency action required.\n\n"
         "=== OUTPUT RULE ===\n"
-        "You must output your response as a JSON object with the following keys:\n"
-        "{\n"
-        "  \"reasoning\": \"A brief explanation of why this score was chosen over the others\",\n"
-        "  \"score\": <integer 1-5>\n"
-        "}\n"
-        "Ensure the score is an integer and adheres strictly to the rubric. Do not add any text outside the JSON.\n\n"
+        "You must output your response as a JSON array of objects. Each object must correspond to an interpretation in the order provided.\n"
+        "Format:\n"
+        "[\n"
+        "  {\n"
+        "    \"reason_index\": 0,\n"
+        "    \"score\": <integer 1-5>,\n"
+        "    \"critique\": \"Brief explanation of why this score was given and its physical grounding\"\n"
+        "  },\n"
+        "  ...\n"
+        "]\n"
+        "Ensure every interpretation is scored. Do not add any text outside the JSON array.\n\n"
         "JSON Response:"
     )
 
@@ -497,12 +502,21 @@ def _infer_score_from_text(text: str, score_scale: Optional[list[int]] = None) -
 
 class RiskAssessmentEngine:
     """
-    Smarter risk assessment engine for the 360° motorcycle safety pipeline.
+    Hybrid risk assessment engine for the 360° motorcycle safety pipeline.
 
-    Two-stage pipeline per epoch:
-    1. ``_generate_reasons_with_logprobs()`` — N independent reason-sampling calls.
-    2. ``_score_synthesized()``            — A single synthesis call that evaluates
-       all reasons and produces a final score distribution.
+    This engine combines the G-VEval mathematical framework with an intelligent
+    synthesis judge.
+
+    Pipeline:
+    1. Reason Sampling: Generate N independent risk interpretations (r_i).
+       Compute probability P(r_i) via softmax-normalized mean log-probabilities.
+    2. Smart Scoring: Use a single synthesis call to judge each reason and
+       assign a grounded score s_i based on physical evidence.
+    3. Mathematical Fusion: The final risk score is the expectation over reasons:
+       Final Score = Σ [P(r_i) * s_i]
+
+    This produces a continuous risk value that represents the probability-weighted
+    average of the most grounded physical interpretations of the scene.
     """
 
     def __init__(
@@ -526,6 +540,10 @@ class RiskAssessmentEngine:
         """
         Calls the model N times independently (temperature > 0) to obtain N
         diverse risk interpretations of the scene.
+
+        Calculates the weight P(r_i) for each reason using the softmax-normalized
+        mean per-token log-probabilities:
+        P(r_i) = exp(mean_lp_i - max(mean_lps)) / Σ exp(mean_lp_j - max(mean_lps))
         """
         prompt = _build_reason_prompt(scene_block)
 
@@ -570,82 +588,70 @@ class RiskAssessmentEngine:
         scene_block:  str,
         reasons:      list[tuple[str, float]],
         score_scale:  list[int],
-    ) -> tuple[dict[int, float], str]:
+    ) -> tuple[list[int], list[str], str]:
         """
-        Smarter scoring: Sends all candidate reasons to the model in a single
-        synthesis call. It attempts to extract a JSON response first, then falls
-        back to log-probability digit extraction.
+        Smarter hybrid scoring: Sends all candidate reasons to the model in a single
+        synthesis call. It asks the model to score each reason individually.
+        Returns a list of scores, a list of critiques, and any fallback notes.
         """
+        n = len(reasons)
         prompt = _build_synthesis_prompt(scene_block, reasons)
 
         response = self.client.chat.completions.create(
             model        = self.model_name,
             messages     = [{"role": "user", "content": prompt}],
             temperature  = 0.0,
-            max_tokens   = 128, # Increased to accommodate reasoning text
+            max_tokens   = 512, # Increased to accommodate critiques for all N reasons
             logprobs     = True,
             top_logprobs = 10,
         )
 
         predicted_text = response.choices[0].message.content.strip()
+        scores = [3] * n
+        critiques = ["No critique provided (fallback)." ] * n
+        fallback_note = ""
 
-        # --- Attempt 1: JSON Parsing ---
+        # --- Attempt 1: JSON Array Parsing ---
         try:
-            # Find JSON block if the model included preambles
-            json_match = re.search(r"\{.*\}", predicted_text, re.DOTALL)
+            json_match = re.search(r"\[.*\]", predicted_text, re.DOTALL)
             if json_match:
                 data = json.loads(json_match.group(0))
-                score = data.get("score")
-                if isinstance(score, int) and score in score_scale:
-                    # Use a one-hot distribution for the JSON score
-                    score_probs = {s: 0.0 for s in score_scale}
-                    score_probs[score] = 1.0
-                    return score_probs, f"JSON success: score {score} synthesized with reasoning: {data.get('reasoning', 'N/A')}"
+                if isinstance(data, list):
+                    # Map by index to be safe
+                    for item in data:
+                        if isinstance(item, dict) and "reason_index" in item:
+                            idx = int(item["reason_index"])
+                            if 0 <= idx < n:
+                                score = item.get("score")
+                                if isinstance(score, int) and score in score_scale:
+                                    scores[idx] = score
+                                    critiques[idx] = item.get("critique", "No critique provided.")
+                    return scores, critiques, "JSON success: scores synthesized with critiques."
         except (json.JSONDecodeError, Exception):
             pass
 
-        # --- Attempt 2: Log-Probability Digit Extraction (Fallback) ---
-        content_logprobs = response.choices[0].logprobs.content
-        target_token_idx = -1
-        for i, tok_info in enumerate(content_logprobs):
-            token_text = tok_info.token.strip()
-            if token_text and token_text[0].isdigit() and int(token_text[0]) in score_scale:
-                target_token_idx = i
-                break
+        # --- Attempt 2: Robust Anchored Regex Fallback (Fixes "first digit" bug) ---
+        found_count = 0
+        for i in range(n):
+            # Search for "Reason 1: 4" or "Interpretation 1: 4" etc.
+            pattern = rf"(?:Reason|Interpretation|Interp)\s*{i+1}[:\s]*([1-5])"
+            match = re.search(pattern, predicted_text, re.IGNORECASE)
+            if match:
+                scores[i] = int(match.group(1))
+                found_count += 1
 
-        if target_token_idx != -1:
-            top_logprobs = content_logprobs[target_token_idx].top_logprobs
+        if found_count > 0:
+            fallback_note = f"JSON failed; extracted {found_count}/{n} scores via anchored regex."
         else:
-            top_logprobs = []
-
-        raw_probs: dict[int, float] = {}
-        for item in top_logprobs:
-            token = item.token.strip()
-            clean_token = token.lstrip()
-            if clean_token and clean_token[0].isdigit():
-                digit = int(clean_token[0])
-                if digit in score_scale:
-                    raw_probs[digit] = max(raw_probs.get(digit, 0.0), math.exp(item.logprob))
-
-        score_probs   = {s: 0.0 for s in score_scale}
-        fallback_note = ""
-        total         = sum(raw_probs.values())
-
-        if total > 0:
-            for s, p in raw_probs.items():
-                score_probs[s] = p / total
-        else:
-            fallback = _infer_score_from_text(predicted_text, score_scale)
-            if fallback is not None:
-                fallback_note = f"JSON and logprobs failed; extracted {fallback} from text"
-                score_probs[fallback] = 1.0
+            # Final fallback: use textual inference for the first reason or just use median
+            fallback_val = _infer_score_from_text(predicted_text, score_scale)
+            if fallback_val is not None:
+                scores = [fallback_val] * n
+                fallback_note = f"All extraction failed; inferred global score {fallback_val} and applied to all."
             else:
-                uniform_weight = 1.0 / len(score_scale)
-                for s in score_scale:
-                    score_probs[s] = uniform_weight
-                fallback_note = f"All extraction failed; used neutral prior"
+                fallback_note = "All extraction failed; used neutral prior (3) for all reasons."
 
-        return score_probs, fallback_note
+        return scores, critiques, fallback_note
 
     # ------------------------------------------------------------------
     # Public API
@@ -658,6 +664,13 @@ class RiskAssessmentEngine:
         telemetry:       Optional[TelemetryData] = None,
         score_scale:     list[int] = [1, 2, 3, 4, 5],
     ) -> dict:
+        """
+        Processes all frames in segmented_items together to capture temporal dynamics.
+
+        Final Score Calculation (G-VEval Hybrid Fusion):
+        Final Score = Σ [P(r_i) * s_i]
+        where P(r_i) is the normalized logprob weight and s_i is the smart-synthesized score.
+        """
         if not segmented_items:
             return {
                 "expected_risk_score": 1.0,
@@ -677,23 +690,30 @@ class RiskAssessmentEngine:
         scene_block = _build_epoch_scene_block(env_description, epoch_agents, telemetry)
         reasons = self._generate_reasons_with_logprobs(scene_block)
 
-        # SMARTER FUSION: Use the single synthesis call instead of N independent calls
-        score_probs, fallback_note = self._score_synthesized(
+        # HYBRID FUSION: Use synthesis call to get a smart score for each sampled reason
+        scores, critiques, fallback_note = self._score_synthesized(
             scene_block, reasons, score_scale
         )
 
-        expected_risk_score = sum(s * p for s, p in score_probs.items())
+        # Final Score = Sum (P(ri) * si)
+        expected_risk_score = sum(p * s for (text, p), s in zip(reasons, scores))
 
-        # We keep reasons_detail for visibility, but the sub_score is now the same for all
-        # since they were synthesized into one final score.
+        # Aggregate probability distribution: P(score=k) = Sum of P(ri) where si=k
+        score_probs = {s: 0.0 for s in score_scale}
+        for (text, p), s in zip(reasons, scores):
+            if s in score_probs:
+                score_probs[s] += p
+
+        # Enrich reasons detail with individual smart scores and critiques
         reasons_detail = [
             {
                 "text": text,
                 "weight": round(p, 4),
-                "sub_score": round(expected_risk_score, 4),
-                "score_probs": {s: round(prob, 4) for s, prob in score_probs.items()},
+                "sub_score": round(s, 4),
+                "critique": crit,
+                "score_probs": {sk: round(prob, 4) for sk, prob in score_probs.items()},
             }
-            for text, p in reasons
+            for (text, p), s, crit in zip(reasons, scores, critiques)
         ]
 
         fallback_notes = [fallback_note] if fallback_note else []
@@ -730,23 +750,39 @@ class RiskAssessmentEngine:
         telemetry:       Optional[TelemetryData] = None,
         score_scale:     list[int] = [1, 2, 3, 4, 5],
     ) -> dict:
+        """
+        Full G-VEval hybrid pipeline for a single frame or set of pre-built DetectedAgents.
+
+        Final Score Calculation (G-VEval Hybrid Fusion):
+        Final Score = Σ [P(r_i) * s_i]
+        where P(r_i) is the normalized logprob weight and s_i is the smart-synthesized score.
+        """
         scene_block = _build_scene_block(env_description, agents, telemetry)
         reasons = self._generate_reasons_with_logprobs(scene_block)
 
-        score_probs, fallback_note = self._score_synthesized(
+        # HYBRID FUSION: Use synthesis call to get a smart score for each sampled reason
+        scores, critiques, fallback_note = self._score_synthesized(
             scene_block, reasons, score_scale
         )
 
-        expected_risk_score = sum(s * p for s, p in score_probs.items())
+        # Final Score = Sum (P(ri) * si)
+        expected_risk_score = sum(p * s for (text, p), s in zip(reasons, scores))
+
+        # Aggregate probability distribution
+        score_probs = {s: 0.0 for s in score_scale}
+        for (text, p), s in zip(reasons, scores):
+            if s in score_probs:
+                score_probs[s] += p
 
         reasons_detail = [
             {
                 "text": text,
                 "weight": round(p, 4),
-                "sub_score": round(expected_risk_score, 4),
-                "score_probs": {s: round(prob, 4) for s, prob in score_probs.items()},
+                "sub_score": round(s, 4),
+                "critique": crit,
+                "score_probs": {sk: round(prob, 4) for sk, prob in score_probs.items()},
             }
-            for text, p in reasons
+            for (text, p), s, crit in zip(reasons, scores, critiques)
         ]
 
         fallback_notes = [fallback_note] if fallback_note else []
