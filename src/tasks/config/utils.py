@@ -1,10 +1,9 @@
 import json
 import os
+from collections import Counter
 from typing import Optional, Sequence
 
 import torch
-
-from src.tasks.roi import format_static_objects_summary
 
 
 # load config
@@ -18,6 +17,15 @@ CONFIG = load_config(os.path.join(os.path.dirname(__file__), "config.json"))
 
 with open(os.path.join(os.path.dirname(__file__), "environment_prompt.md"), "r") as f:
     ENV_PROMPT = f.read()
+
+
+def format_static_objects_summary(static_objects: Optional[Sequence[dict]]) -> str:
+    if not static_objects:
+        return "[]"
+    return str([
+        {"class_name": item.get("class_name"), "count": item.get("count", 1)}
+        for item in static_objects
+    ])
 
 
 def render_environment_prompt(prompt: str, static_objects: Optional[Sequence[dict]] = None) -> str:

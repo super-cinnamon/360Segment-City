@@ -51,11 +51,11 @@
     "processing": {
         "roi_enabled": true,
         "roi_threshold": 0.7,
-        "image_scale": 1.0
+        "image_scale": 0.7
     },
     "risk_assessment": {
         "api_base": "http://localhost:5015/v1",
-        "model_name": "nvidia/Cosmos3-Edge",
+        "model_name": "nvidia/Cosmos3-Nano",
         "epoch_window_size": 50
     }
 }

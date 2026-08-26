@@ -1,4 +1,5 @@
 # using ollama as a first base, we will get environment descriptions
+# ! try other models
 import multiprocessing as mp
 import os
 import sys

@@ -6,6 +6,8 @@ from typing import Iterable, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
+from src.tasks.config.utils import CONFIG
+
 
 ROI_KEYWORDS: list[tuple[str, float]] = [
     ("crossroad", 1.25),
@@ -107,24 +109,38 @@ def should_process_window(
     return score >= roi_threshold
 
 
-def resize_frame(frame: np.ndarray, scale: float = 1.0) -> np.ndarray:
+DEFAULT_IMAGE_SCALE = float(CONFIG.get("processing", {}).get("image_scale", 0.7))
+
+
+def reduce_image_resolution(
+    frame: np.ndarray,
+    resolution_scale: float = DEFAULT_IMAGE_SCALE,
+) -> np.ndarray:
+    """Downscale a single image using the configured processing scale by default."""
     if frame is None:
         return frame
-    if scale is None:
+    if resolution_scale is None:
         return frame
-    if scale <= 0.0:
+    if resolution_scale <= 0.0:
         return frame
-    if scale >= 1.0:
+    if resolution_scale >= 1.0:
         return frame
 
     height, width = frame.shape[:2]
     if width == 0 or height == 0:
         return frame
-    new_size = (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
+    new_size = (
+        max(1, int(round(width * resolution_scale))),
+        max(1, int(round(height * resolution_scale))),
+    )
     return cv2.resize(frame, new_size)
 
 
-def resize_frames(frames: Sequence[np.ndarray], scale: float = 1.0) -> list[np.ndarray]:
+def resize_frame(frame: np.ndarray, scale: float = DEFAULT_IMAGE_SCALE) -> np.ndarray:
+    return reduce_image_resolution(frame, resolution_scale=scale)
+
+
+def resize_frames(frames: Sequence[np.ndarray], scale: float = DEFAULT_IMAGE_SCALE) -> list[np.ndarray]:
     if frames is None:
         return []
     return [resize_frame(frame, scale=scale) for frame in frames]
@@ -145,10 +161,3 @@ def build_static_objects_summary(environment_items: Iterable[Sequence[dict]]) ->
     ]
 
 
-def format_static_objects_summary(static_objects: Optional[Sequence[dict]]) -> str:
-    if not static_objects:
-        return "[]"
-    return str([
-        {"class_name": item.get("class_name"), "count": item.get("count", 1)}
-        for item in static_objects
-    ])

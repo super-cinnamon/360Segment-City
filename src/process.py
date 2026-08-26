@@ -1,6 +1,9 @@
 # for parallel processing
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
+import os
+import pickle
+from pathlib import Path
 from src.tasks.preprocessing import (
     load_cubic,
     split_frames,
@@ -21,7 +24,6 @@ from src.tasks.risk_assessment import (
 )
 from src.tasks.roi import (
     build_static_objects_summary,
-    format_static_objects_summary,
     resize_frames,
     should_process_window,
 )
@@ -63,6 +65,24 @@ class VideoProcessor:
             # frames will pass them into methods instead
             self.cubic_frames = None
 
+    def _get_cache_path(self, prefix, epoch_idx, raw_start, raw_end):
+        if os.environ.get("test") != "1":
+            return None
+
+        video_name = os.path.basename(self.video_loader.video_path)
+        cache_dir = Path("data/cache/vision")
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        # Use raw_start and raw_end for stable indexing
+        if raw_start is not None and raw_end is not None:
+            idx_str = f"{raw_start}_{raw_end}"
+        elif epoch_idx is not None:
+            idx_str = f"epoch_{epoch_idx}"
+        else:
+            return None
+
+        return cache_dir / f"{prefix}_{video_name}_{idx_str}.pkl"
+
     def get_depth_mask(self):
         # Backwards-compatible no-arg form: use preloaded frames if present.
         if self.cubic:
@@ -74,11 +94,23 @@ class VideoProcessor:
             depths = predict_depths(frames)
             return depths
 
-    def get_depth_mask_for(self, frames):
+    def get_depth_mask_for(self, frames, epoch_idx=None, raw_start=None, raw_end=None):
         # New API: compute depths for either cubic dict or list of frames
+        cache_path = self._get_cache_path("depth", epoch_idx, raw_start, raw_end)
+        if cache_path and cache_path.exists():
+            with open(cache_path, "rb") as f:
+                return pickle.load(f)
+
         if self.cubic:
-            return predict_cubic_depths(frames)
-        return predict_depths(frames)
+            result = predict_cubic_depths(frames)
+        else:
+            result = predict_depths(frames)
+
+        if cache_path:
+            with open(cache_path, "wb") as f:
+                pickle.dump(result, f)
+
+        return result
 
     def segment(self, object_name=None):
         # for this model there is no object name so we ignore for now
@@ -90,11 +122,23 @@ class VideoProcessor:
         segmentation_masks = predict_segmentations(frames)
         return segmentation_masks
 
-    def segment_for(self, frames, object_name=None):
+    def segment_for(self, frames, object_name=None, epoch_idx=None, raw_start=None, raw_end=None):
         # New API: segmentation for provided frames (either cubic dict or list)
+        cache_path = self._get_cache_path("seg", epoch_idx, raw_start, raw_end)
+        if cache_path and cache_path.exists():
+            with open(cache_path, "rb") as f:
+                return pickle.load(f)
+
         if self.cubic:
-            return predict_cubic_segmentations(frames)
-        return predict_segmentations(frames)
+            result = predict_cubic_segmentations(frames)
+        else:
+            result = predict_segmentations(frames)
+
+        if cache_path:
+            with open(cache_path, "wb") as f:
+                pickle.dump(result, f)
+
+        return result
 
     def clean_segmentation(self, depth_masks, segmentation_masks):
         # get the closest depth mask for the segmentation mask
@@ -113,17 +157,25 @@ class SegmentationPipeline:
         self.video_loader = VideoLoader(video_path)
         self.video_processor = VideoProcessor(self.video_loader, cubic=cubic)
 
-    def _get_image_scale(self) -> float:
+    # ! update and fix whatever copilot messed with here and write proper code
+    def _get_image_scale(self, image_scale: float | None = None) -> float:
+        if image_scale is not None:
+            try:
+                image_scale = float(image_scale)
+            except (TypeError, ValueError):
+                image_scale = 0.7
+            return max(0.0, min(1.0, image_scale))
+
         processing_cfg = CONFIG.get("processing", {})
-        image_scale = processing_cfg.get("image_scale", 1.0)
+        image_scale = processing_cfg.get("image_scale", 0.7)
         try:
             image_scale = float(image_scale)
         except (TypeError, ValueError):
-            image_scale = 1.0
+            image_scale = 0.7
         return max(0.0, min(1.0, image_scale))
 
-    def _prepare_frames_for_inference(self, frames):
-        scale = self._get_image_scale()
+    def _prepare_frames_for_inference(self, frames, image_scale: float | None = None):
+        scale = self._get_image_scale(image_scale)
         if self.video_processor.cubic:
             if isinstance(frames, dict):
                 cubic_frames = frames
@@ -174,12 +226,12 @@ class SegmentationPipeline:
 
         return segmented_items
 
-    def process_vision(self, object_name=None):
+    def process_vision(self, object_name=None, image_scale: float | None = None):
         # Backwards-compatible default behaviour (no frames provided): run as before
         if self.video_loader.frames is None:
             self.video_loader.frames = self.video_loader.get_split_frames()
 
-        prepared_frames = self._prepare_frames_for_inference(self.video_loader.frames)
+        prepared_frames = self._prepare_frames_for_inference(self.video_loader.frames, image_scale=image_scale)
         depth_masks = self.video_processor.get_depth_mask_for(prepared_frames)
         segmentation_masks = self.video_processor.segment_for(prepared_frames, object_name)
         # create the list of segmented items with their class names and which frame they belong to
@@ -215,22 +267,30 @@ class SegmentationPipeline:
         return segmented_items, environment_items
 
     # * is the same as the function i wrote above, but just takes specific frames as input, above function will be removed later
-    def process_vision_for(self, frames, object_name=None, prepared_frames=None):
+    def process_vision_for(self, frames, object_name=None, prepared_frames=None, image_scale: float | None = None, epoch_idx=None, raw_start=None, raw_end=None):
         """
         Process a provided list of frames (or cubic dict) and return segmented items.
         This allows sliding-window processing without changing the core logic.
         """
         if prepared_frames is None:
-            prepared_frames = self._prepare_frames_for_inference(frames)
+            prepared_frames = self._prepare_frames_for_inference(frames, image_scale=image_scale)
 
         # compute depth masks and segmentation masks for provided frames
         if self.video_processor.cubic:
-            depth_masks = self.video_processor.get_depth_mask_for(prepared_frames)
-            segmentation_masks = self.video_processor.segment_for(prepared_frames, object_name)
+            depth_masks = self.video_processor.get_depth_mask_for(
+                prepared_frames, epoch_idx=epoch_idx, raw_start=raw_start, raw_end=raw_end
+            )
+            segmentation_masks = self.video_processor.segment_for(
+                prepared_frames, object_name, epoch_idx=epoch_idx, raw_start=raw_start, raw_end=raw_end
+            )
             frames_front = prepared_frames["front"]
         else:
-            depth_masks = self.video_processor.get_depth_mask_for(prepared_frames)
-            segmentation_masks = self.video_processor.segment_for(prepared_frames, object_name)
+            depth_masks = self.video_processor.get_depth_mask_for(
+                prepared_frames, epoch_idx=epoch_idx, raw_start=raw_start, raw_end=raw_end
+            )
+            segmentation_masks = self.video_processor.segment_for(
+                prepared_frames, object_name, epoch_idx=epoch_idx, raw_start=raw_start, raw_end=raw_end
+            )
             frames_front = prepared_frames
 
         # create the list of segmented items with their class names and which frame they belong to
@@ -260,9 +320,9 @@ class SegmentationPipeline:
             segmented_items.append(frame_segments)
             environment_items.append(environment_segments)
         # prune segmentation items based on depth
-        segmented_items = self.prune_depth(segmented_items)         
+        segmented_items = self.prune_depth(segmented_items)
         environment_items = self.prune_depth(environment_items)
-        
+
         return segmented_items, environment_items
 
     # * here is where the environment description is generated, the detected static elements will be added here next time
@@ -323,6 +383,10 @@ class SegmentationPipeline:
             prompt: str = ENV_PROMPT,
             roi_enabled: Optional[bool] = None,
             roi_threshold: Optional[float] = None,
+            image_scale: Optional[float] = None,
+            epoch_idx: Optional[int] = None,
+            raw_start: Optional[int] = None,
+            raw_end: Optional[int] = None,
     ) -> dict:
         """Run ROI gating, environment description generation, segmentation, and risk assessment for one window."""
         if roi_enabled is None:
@@ -357,6 +421,9 @@ class SegmentationPipeline:
             frames,
             object_name=object_name,
             prepared_frames=prepared_frames,
+            epoch_idx=epoch_idx,
+            raw_start=raw_start,
+            raw_end=raw_end,
         )
         static_objects = build_static_objects_summary(environment_items)
         refined_environment_description = self.process_environment_for(

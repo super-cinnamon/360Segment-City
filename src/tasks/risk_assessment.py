@@ -32,6 +32,7 @@ References
 import re
 import json
 import math
+import logging
 import cv2
 import base64
 import numpy as np
@@ -40,6 +41,9 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from src.tasks.config.utils import CONFIG
+
+# Module logger
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Module-level config aliases
@@ -166,7 +170,6 @@ class DetectedAgent:
     mask:            Optional[np.ndarray] = field(default=None, repr=False)
     was_fused:       bool = False
 
-
 # ---------------------------------------------------------------------------
 # 2. Factory helpers
 # ---------------------------------------------------------------------------
@@ -222,6 +225,7 @@ def build_agents_from_segments(
     return agents
 
 
+# ? normalization of depth across frames of the epoch
 def compute_depth_bounds(segmented_items: list[list[dict]]) -> tuple[float, float]:
     """
     Scans the entire batch of frames to find global (min, max) mode_depth values
@@ -369,8 +373,8 @@ def _build_scene_block(
 
 def _build_reason_prompt(scene_block: str) -> str:
     """
-    Step 1 prompt — asks the model to produce ONE focused, polar risk-interpretation
-    by analyzing physical safety margins (TTC, proximity) and counterfactuals.
+    Step 1 prompt — asks the model to produce a concise, actionable dynamic hazard
+    in a defensive-driving JSON format.
     """
     criteria_text = "\n".join(
         f"  {i+1}. {name}: {desc}"
@@ -378,74 +382,95 @@ def _build_reason_prompt(scene_block: str) -> str:
     )
 
     return (
-        "You are an expert road-safety auditor evaluating crash risk for a motorcycle rider "
-        "equipped with a 360° perception system.\n\n"
-        "=== TASK OVERVIEW ===\n"
-        "Analyze the temporal scene data below. Your goal is to identify the SINGLE MOST "
-        "critical risk trajectory or confirm the complete absence of physical hazards.\n\n"
-        "=== EVALUATION CRITERIA ===\n"
-        f"{criteria_text}\n\n"
+        "SYSTEM ROLE:\n"
+        "You are an expert Defensive Driving AI for a two-wheeled vehicle (motorcycle/bicycle/e-bike). "
+        "Your goal is to analyze a 1-second 360-degree video snippet, cross-reference it with the provided "
+        "object list and distance metrics, and identify actionable dynamic hazards.\n\n"
+        "STRICT DO NOT USE / NEGATIVE CONSTRAINTS:\n"
+        "1. NEVER mention camera attributes, field of view, mounting position, or system capabilities "
+        "(e.g., DO NOT say 'The rider has a 360 view', 'The camera detects...', 'Because of the lens...').\n"
+        "2. NEVER use conversational filler, meta commentary, or chain-of-thought language such as 'Okay, let me think',\n"
+        "   'The user wants me to...', 'I see', 'as an AI', or any sentence that is not a hazard observation.\n"
+        "3. NEVER describe static environment features as hazards unless they actively restrict trajectory or visibility "
+        "(e.g., DO NOT say 'There is a parked car.' SAY 'The parked SUV obstructs visibility of emerging pedestrians from the right sidewalk').\n"
+        "4. NEVER state the obvious presence of moving objects without a hazard mechanism "
+        "(e.g., DO NOT say 'A car is driving next to me.' SAY 'The sedan on the left is matching speed in my blind spot, blocking lateral evasive maneuvers').\n"
+        "5. NEVER output a safe placeholder like 'No additional distinct hazard produced.' unless the scene is truly clear;\n"
+        "   if the scene is clear, return an empty hazards array [] inside the JSON object.\n"
+        "6. NEVER invent object IDs, distances, or lane geometry that are not supported by the scene data.\n\n"
+        "GROUNDING RULES FOR EACH HAZARD:\n"
+        "- observation: one concrete, physically grounded sentence describing what is visible or moving. Use terms like\n"
+        "  'left-side sedan', 'wet metal seam', 'narrowing gap', 'approaching cyclist', or 'braking lead vehicle'.\n"
+        "- danger_reasoning: explain the mechanism in 1-2 clauses: how it threatens the rider, why it matters now, and what\n"
+        "  specific action is needed. Do not mention being an AI or discussing the prompt.\n"
+        "- actionable_risk: give imperative defensive-driving guidance such as 'Reduce speed and hold the left edge' or\n"
+        "  'Prepare a controlled swerve to the right'.\n"
+        "- Each object in hazards[] must be tied to a specific physical threat: a nearby agent, a road-state issue, or a blocked\n"
+        "  escape path. If nothing is grounded, return an empty array [].\n\n"
+        "EVALUATION FRAMEWORK (Analyze hazards across these 4 categories):\n"
+        "1. Trajectory Conflict & Time-to-Collision (TTC):\n"
+        "   - Vehicles turning across the path (Dooring, left turns, sudden lane cuts).\n"
+        "   - Speed/distance differentials based on the provided object bounding boxes.\n"
+        "2. Visibility Obscuration & Blind Spots:\n"
+        "   - Sightline blockages caused by large vehicles, pillars, or street furniture.\n"
+        "   - Areas where a hazard could emerge within < 1.5 seconds.\n"
+        "3. Surface & Traction Degradation:\n"
+        "   - Road surface hazards specifically dangerous to 2-wheelers (manhole covers, gravel, wet metal, track rails, sudden asphalt changes).\n"
+        "4. Ego-Vehicle Trajectory Constraints:\n"
+        "   - Escape routes: Is the rider boxed in on the left/right?\n"
+        "   - Following distance: Is the vehicle ahead braking or stopping abruptly?\n\n"
         "=== SCENE DATA (EPOCH BATCH) ===\n"
         f"{scene_block}\n\n"
-        "=== MANDATORY ANALYSIS STEPS ===\n"
-        "1. KINEMATIC CHECK: Identify the minimum Time-To-Collision (TTC), sudden deceleration/acceleration "
-        "   (>3 m/s²), or aggressive lateral shifts (cut-ins/encroachments) across all agent tracks.\n"
-        "2. COUNTERFACTUAL BOUNDARY TEST:\n"
-        "   - Is this scenario SAFE (Minimal Risk)? Explain why no agent trajectory intersects or threatens the rider.\n"
-        "   - OR is this scenario CRITICAL (High/Severe Risk)? Explain what immediate evasive action or physical "
-        "     hazard pushes this beyond routine driving.\n"
-        "3. POLARITY FOCUS: Do NOT summarize the scene as 'mildly cautious' or 'moderate.' Take a definitive stand "
-        "   on whether the scene leans clearly safe or clearly hazardous based on physical spatial margins.\n\n"
-        "=== OUTPUT INSTRUCTIONS ===\n"
-        "Write 1 concise risk interpretation (3-4 sentences). Reference specific track IDs, exact depth/distance "
-        "values, and velocity/TTC figures. Do NOT assign a score number.\n\n"
-        "Risk Interpretation:"
+        "=== EVALUATION CRITERIA ===\n"
+        f"{criteria_text}\n\n"
+        "=== OUTPUT FORMAT ===\n"
+        "Produce a single JSON object. The output must be valid JSON only. No markdown fences. No commentary. No filler text.\n"
+        "Use this structure exactly:\n"
+        "{\n"
+        "  \"hazards\": [\n"
+        "    {\n"
+        "      \"object_id\": \"<ID_from_input_list_if_applicable>\",\n"
+        "      \"hazard_type\": \"<Collision Risk | Visibility Blocker | Surface Hazard | Trajectory Constraint>\",\n"
+        "      \"location_relative\": \"<e.g., 2 o'clock, 5 meters ahead>\",\n"
+        "      \"observation\": \"<Concrete scene-grounded description of the visible object or road state>\",\n"
+        "      \"danger_reasoning\": \"<Short mechanism: why the rider is exposed or can lose control within the next 1-2 seconds>\",\n"
+        "      \"actionable_risk\": \"<Defensive-driving instruction>\"\n"
+        "    }\n"
+        "  ]\n"
+        "}\n"
+        "Example of a valid hazard object:\n"
+        "{\"hazards\":[{\"object_id\":\"car_12\",\"hazard_type\":\"Collision Risk\",\"location_relative\":\"left rear quarter\",\"observation\":\"A sedan is cutting left while closing to the rider's lane edge.\",\"danger_reasoning\":\"The rider's left-side escape route is shrinking and the vehicle is encroaching into the shared path, leaving little time to brake or swerve.\",\"actionable_risk\":\"Reduce speed and keep a wider left buffer.\"}]}\n"
+        "Important: if the scene contains no physically grounded threat, return \"hazards\": [] as the array inside the JSON object. Do not fabricate a 'no hazard' narrative.\n"
+        "Return only JSON and no extra prose.\n\n"
+        "JSON Response:"
     )
 
 
-def _build_synthesis_prompt(scene_block: str, reasons: list[tuple[str, float]]) -> str:
+def _build_reason_scoring_prompt(scene_block: str, reason: tuple[str, float], reason_index: int) -> str:
     """
-    Builds a prompt for the 'Hybrid' scoring phase.
-    It presents all sampled reasons and asks the model to judge and score each one
-    individually, allowing it to cross-reference and remove hallucinations.
+    Builds a prompt for the per-reason scoring phase.
+    Reasons are generated in one call, but each reason is scored independently
+    with its own model request so that different interpretations cannot collapse
+    to the same score.
     """
-    reasons_list = "\n".join(
-        f"Interpretation {i+1} (Confidence: {p:.2%}):\n{text}"
-        for i, (text, p) in enumerate(reasons)
-    )
+    text, probability = reason
+    human = _humanize_hazards(text) if isinstance(text, (str, dict)) else str(text)
 
     return (
-        "You are a master road-safety judge. You are provided with a scene description "
-        "and several candidate risk interpretations generated by an analysis model.\n\n"
+        "You are a master road-safety judge. Score this interpretation in isolation.\n\n"
         "=== SCENE DATA ===\n"
         f"{scene_block}\n\n"
-        "=== CANDIDATE INTERPRETATIONS ===\n"
-        f"{reasons_list}\n\n"
-        "=== SYNTHESIS TASK ===\n"
-        "Your goal is to audit each candidate interpretation and assign it a risk score based on physical grounding.\n"
-        "1. EVALUATE: For each interpretation, determine if it is physically grounded in the scene data (e.g., correct TTC, proximity, track IDs).\n"
-        "2. CRITIQUE: Identify any hallucinations (claims about objects not present) or vagueness (generic terms without data).\n"
-        "3. SCORE: Assign a risk score (1-5) to each interpretation based on the most accurate physical hazards it identifies. "
-        "If an interpretation is a hallucination or totally vague, assign it a neutral score of 3.\n"
-        "4. POLARIZE: For grounded hazards, push the score to 4 or 5. For grounded clear roads, push to 1 or 2.\n\n"
-        "=== RIGID ANCHOR RUBRIC ===\n"
-        "• 1 (Minimal Risk): Free flow, buffers >5s TTC. No threat.\n"
-        "• 2 (Low Risk): Routine adjustments, no path conflicts.\n"
-        "• 3 (Moderate Risk): Noticeable interaction (TTC 3-5s), mild encroachment.\n"
-        "• 4 (High Risk): Abrupt hazard, hard braking, TTC 2-3s. Active adjustment needed.\n"
-        "• 5 (Severe Risk): Immediate collision threat, TTC < 2s. Emergency action required.\n\n"
-        "=== OUTPUT RULE ===\n"
-        "You must output your response as a JSON array of objects. Each object must correspond to an interpretation in the order provided.\n"
-        "Format:\n"
-        "[\n"
-        "  {\n"
-        "    \"reason_index\": 0,\n"
-        "    \"score\": <integer 1-5>,\n"
-        "    \"critique\": \"Brief explanation of why this score was given and its physical grounding\"\n"
-        "  },\n"
-        "  ...\n"
-        "]\n"
-        "Ensure every interpretation is scored. Do not add any text outside the JSON array.\n\n"
+        "=== INTERPRETATION TO SCORE ===\n"
+        f"Interpretation {reason_index + 1} (Confidence: {probability:.2%}):\n{human}\n\n"
+        "=== RIGID RUBRIC ===\n"
+        "1 = MINIMAL RISK  — Clear road; all agents distant; no action required.\n"
+        "2 = LOW RISK      — Light traffic nearby; standard defensive riding applies.\n"
+        "3 = MODERATE RISK — Elevated caution required; one or more agents are close or behaving unpredictably; a speed or position adjustment may be needed.\n"
+        "4 = HIGH RISK     — Significant hazard; braking or evasive manoeuvre likely required soon; collision window is opening.\n"
+        "5 = SEVERE RISK   — Imminent hazard; emergency manoeuvre required right now or collision is unavoidable.\n\n"
+        "Score this interpretation using only facts in the scene. Return exactly one JSON object with this schema:\n"
+        "{ \"reason_index\": <int>, \"score\": 1-5, \"critique\": \"one-sentence grounding\" }\n"
+        "Do not emit any text outside the JSON object.\n\n"
         "JSON Response:"
     )
 
@@ -454,6 +479,7 @@ def _build_synthesis_prompt(scene_block: str, reasons: list[tuple[str, float]]) 
 # 4. Helper utilities
 # ---------------------------------------------------------------------------
 
+# ! problematic approach
 def _infer_score_from_text(text: str, score_scale: Optional[list[int]] = None) -> Optional[int]:
     """Infer a likely score from free-form model output when the model does not emit a clean digit."""
     if not text:
@@ -496,6 +522,178 @@ def _infer_score_from_text(text: str, score_scale: Optional[list[int]] = None) -
     return None
 
 
+def _canonical_reason_payload(reason: dict) -> str:
+    """Build a stable signature for deduplicating hazard payloads."""
+    hazards = reason.get("hazards") if isinstance(reason, dict) else []
+    if not isinstance(hazards, list):
+        return ""
+    return json.dumps(hazards, sort_keys=True, ensure_ascii=False)
+
+
+def _deduplicate_reason_payloads(reason_payloads: list[dict], target_count: int) -> list[dict]:
+    """Drop repeated hazard payloads and avoid filling missing slots with invented reasons."""
+    unique: list[dict] = []
+    seen: set[str] = set()
+
+    for reason in reason_payloads:
+        canonical = _canonical_reason_payload(reason)
+        if not canonical:
+            continue
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        unique.append(reason)
+
+    # Never invent missing reasons. If the model produced fewer valid candidates,
+    # return only the grounded candidates we actually received.
+    return unique[:target_count]
+
+
+def _humanize_hazards(hazard_payload: str | dict) -> str:
+    """Turn a hazards JSON (string or dict) into a concise human-readable block.
+
+    This helps the synthesis judge see the concrete observations and avoid
+    scoring based on irrelevant prompt tokens.
+    """
+    try:
+        if isinstance(hazard_payload, str):
+            parsed = json.loads(hazard_payload)
+        else:
+            parsed = hazard_payload
+    except Exception:
+        return str(hazard_payload)
+
+    lines: list[str] = []
+    if isinstance(parsed, list):
+        hazards = parsed
+    elif isinstance(parsed, dict) and isinstance(parsed.get("hazards"), list):
+        hazards = parsed.get("hazards", [])
+    else:
+        return str(hazard_payload)
+
+    for i, h in enumerate(hazards):
+        oid = h.get("object_id", "unknown")
+        htype = h.get("hazard_type", "unknown")
+        loc = h.get("location_relative", "unknown")
+        obs = h.get("observation", "(no observation)")
+        dr = h.get("danger_reasoning", "(no reasoning)")
+        lines.append(f"Hazard {i+1}: [{htype}] {obs} (obj:{oid}, loc:{loc})")
+        lines.append(f"  Mechanism: {dr}")
+
+    return "\n".join(lines)
+
+
+def _strip_meta_preface(text: str) -> str:
+    """Remove leading conversational/meta prefacing from model output.
+
+    This strips sentences that look like chain-of-thought or prompt restatement
+    (e.g. "Okay, let's break this down...", "As an AI...") and returns the
+    remainder starting from the first sentence that contains grounding cues.
+    """
+    if not text:
+        return text
+
+    # Sentence-split conservatively
+    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+    if len(sentences) <= 1:
+        return text.strip()
+
+    meta_prefix_re = re.compile(r"^(?:ok(?:ay)?|let'?s|i\b|as an ai|the user|dear|note)\b", re.IGNORECASE)
+    grounding_keywords = [
+        "left", "right", "front", "rear", "pedestrian", "cyclist", "bicycle",
+        "vehicle", "car", "truck", "brake", "approach", "approaching", "ttc",
+        "proximity", "meter", "m", "speed", "closing", "encroach", "obstruct",
+        "visibility", "lane", "collision", "skid", "slide",
+    ]
+
+    start_idx = 0
+    for i, sent in enumerate(sentences):
+        s = sent.strip()
+        if not s:
+            start_idx = i + 1
+            continue
+
+        # If sentence looks explicitly meta/conversational, skip it
+        if meta_prefix_re.search(s):
+            start_idx = i + 1
+            continue
+
+        # If sentence contains any grounding keyword, keep from here
+        low = s.lower()
+        if any(k in low for k in grounding_keywords):
+            start_idx = i
+            break
+
+        # otherwise treat short non-grounding sentences as meta and skip
+        if len(s.split()) < 6:
+            start_idx = i + 1
+            continue
+
+        # Default: first reasonably long sentence is probably grounded
+        start_idx = i
+        break
+
+    remainder = " ".join(sentences[start_idx:]).strip()
+    return remainder or text.strip()
+
+
+def _extract_model_content(response) -> str:
+    """Return the raw model completion text if available, otherwise an empty string."""
+    try:
+        choice = response.choices[0]
+        return getattr(choice.message, "content", "") or str(choice.message.content)
+    except Exception:
+        return ""
+
+
+def _log_world_model_call(label: str, prompt: str, response) -> None:
+    """Log the full request summary and the raw model output for each world-model call."""
+    try:
+        msg_p = "[%s] prompt (trunc): %s" % (label, (prompt or "")[:3000])
+        logger.info(msg_p)
+        print(msg_p)
+    except Exception:
+        pass
+
+    try:
+        content = _extract_model_content(response)
+        msg_o = "[%s] output (trunc): %s" % (label, content[:4000])
+        logger.info(msg_o)
+        print(msg_o)
+    except Exception:
+        pass
+
+    _log_model_response(label, response)
+
+
+def _log_model_response(label: str, response) -> None:
+    """Safely log a model response summary for debugging.
+
+    Avoid dumping full objects or secrets; log truncated content, token counts,
+    and any usage metadata if available.
+    """
+    content = _extract_model_content(response)
+
+    try:
+        logger.debug("[%s] model content (trunc): %s", label, content[:2000])
+    except Exception:
+        pass
+
+    try:
+        choice = response.choices[0]
+        lp_tokens = list(getattr(choice.logprobs, "content", []) or [])
+        logger.debug("[%s] token_logprob_count=%d", label, len(lp_tokens))
+    except Exception:
+        pass
+
+    try:
+        usage = getattr(response, "usage", None)
+        if usage:
+            logger.debug("[%s] usage: %s", label, str(usage))
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # 4. Risk Assessment Engine
 # ---------------------------------------------------------------------------
@@ -532,7 +730,6 @@ class RiskAssessmentEngine:
     # ------------------------------------------------------------------
     # Step 1 — Reason sampling with logprob weights
     # ------------------------------------------------------------------
-
     def _generate_reasons_with_logprobs(
         self,
         scene_block: str,
@@ -542,42 +739,80 @@ class RiskAssessmentEngine:
         diverse risk interpretations of the scene.
 
         Calculates the weight P(r_i) for each reason using the softmax-normalized
-        mean per-token log-probabilities:
-        P(r_i) = exp(mean_lp_i - max(mean_lps)) / Σ exp(mean_lp_j - max(mean_lps))
+        mean per-token log-probabilities.
         """
         prompt = _build_reason_prompt(scene_block)
+        reasons_data = []
+        mean_lps = []
 
-        reason_texts: list[str]   = []
-        mean_logprobs: list[float] = []
-
-        for _ in range(self.n_reasons):
+        for i in range(self.n_reasons):
             response = self.client.chat.completions.create(
                 model       = self.model_name,
                 messages    = [{"role": "user", "content": prompt}],
                 temperature = 0.7,
-                max_tokens  = 128,
+                max_tokens  = 4096, # * change later
                 logprobs    = True,
             )
 
+            _log_world_model_call(f"reason_sampling_{i}", prompt, response)
+
             choice = response.choices[0]
-            reason_texts.append(choice.message.content.strip())
+            predicted_text = choice.message.content.strip()
 
-            token_logprobs = [
-                tok.logprob
-                for tok in (choice.logprobs.content or [])
-                if tok.logprob is not None
-            ]
-            mean_lp = (
-                float(np.mean(token_logprobs)) if token_logprobs else -10.0
-            )
-            mean_logprobs.append(mean_lp)
+            # 1. Parse the reason
+            reason_item = None
+            try:
+                json_match = re.search(r"\{.*\}", predicted_text, re.DOTALL)
+                if json_match:
+                    data = json.loads(json_match.group(0))
+                    if isinstance(data, dict) and "hazards" in data:
+                        reason_item = data
+            except Exception:
+                pass
 
-        lp_arr   = np.array(mean_logprobs, dtype=float)
+            if not reason_item:
+                # Fallback for free-form text
+                text = _strip_meta_preface(predicted_text)
+                if text:
+                    reason_item = {
+                        "hazards": [{
+                            "object_id": "error",
+                            "hazard_type": "Collision Risk",
+                            "location_relative": "unknown",
+                            "observation": text[:200],
+                            "danger_reasoning": "Model produced free-form text instead of JSON.",
+                            "actionable_risk": "Maintain defensive speed.",
+                        }]
+                    }
+                else:
+                    # Total failure for this sample
+                    continue
+
+            # Sanitize hazards
+            for h in reason_item.get("hazards", []):
+                if isinstance(h.get("observation"), str):
+                    h["observation"] = _strip_meta_preface(h.get("observation", "")).strip()
+                if isinstance(h.get("danger_reasoning"), str):
+                    h["danger_reasoning"] = _strip_meta_preface(h.get("danger_reasoning", "")).strip()
+
+            # 2. Compute mean logprob for this reason
+            tokens = list(choice.logprobs.content or [])
+            token_logps = [float(getattr(tok, "logprob", -100.0)) for tok in tokens]
+            mean_lp = float(np.mean(token_logps)) if token_logps else -10.0
+
+            reasons_data.append(reason_item)
+            mean_lps.append(mean_lp)
+
+        if not reasons_data:
+            return []
+
+        # Normalize weights via softmax
+        lp_arr = np.array(mean_lps, dtype=float)
         lp_shift = lp_arr - lp_arr.max()
-        exp_lp   = np.exp(lp_shift)
+        exp_lp = np.exp(lp_shift)
         p_reasons = (exp_lp / exp_lp.sum()).tolist()
 
-        return list(zip(reason_texts, p_reasons))
+        return [(json.dumps(d.get("hazards", []), ensure_ascii=False), float(w)) for d, w in zip(reasons_data, p_reasons)]
 
     # ------------------------------------------------------------------
     # Step 2 — Synthesized Scoring (Smarter Fusion)
@@ -590,68 +825,86 @@ class RiskAssessmentEngine:
         score_scale:  list[int],
     ) -> tuple[list[int], list[str], str]:
         """
-        Smarter hybrid scoring: Sends all candidate reasons to the model in a single
-        synthesis call. It asks the model to score each reason individually.
-        Returns a list of scores, a list of critiques, and any fallback notes.
+        Score each reason independently with a dedicated model call.
+
+        Generation still happens in a single batch call, but scoring is intentionally
+        isolated per reason so that one interpretation cannot be forced to match
+        another due to an aggregate scoring pass.
         """
         n = len(reasons)
-        prompt = _build_synthesis_prompt(scene_block, reasons)
+        scores: list[int] = []
+        critiques: list[str] = []
+        notes: list[str] = []
 
-        response = self.client.chat.completions.create(
-            model        = self.model_name,
-            messages     = [{"role": "user", "content": prompt}],
-            temperature  = 0.0,
-            max_tokens   = 512, # Increased to accommodate critiques for all N reasons
-            logprobs     = True,
-            top_logprobs = 10,
-        )
+        for idx, reason in enumerate(reasons):
+            prompt = _build_reason_scoring_prompt(scene_block, reason, idx)
+            response = self.client.chat.completions.create(
+                model        = self.model_name,
+                messages     = [{"role": "user", "content": prompt}],
+                temperature  = 0.0,
+                max_tokens   = 4096, # * change later
+                logprobs     = True,
+                top_logprobs = 10,
+            )
 
-        predicted_text = response.choices[0].message.content.strip()
-        scores = [3] * n
-        critiques = ["No critique provided (fallback)." ] * n
-        fallback_note = ""
+            predicted_text = response.choices[0].message.content.strip()
+            try:
+                _log_world_model_call(f"reason_scoring_{idx}", prompt, response)
+            except Exception:
+                logger.exception("Failed to log reason_scoring_%s response", idx)
 
-        # --- Attempt 1: JSON Array Parsing ---
-        try:
-            json_match = re.search(r"\[.*\]", predicted_text, re.DOTALL)
-            if json_match:
-                data = json.loads(json_match.group(0))
-                if isinstance(data, list):
-                    # Map by index to be safe
-                    for item in data:
-                        if isinstance(item, dict) and "reason_index" in item:
-                            idx = int(item["reason_index"])
-                            if 0 <= idx < n:
-                                score = item.get("score")
-                                if isinstance(score, int) and score in score_scale:
-                                    scores[idx] = score
-                                    critiques[idx] = item.get("critique", "No critique provided.")
-                    return scores, critiques, "JSON success: scores synthesized with critiques."
-        except (json.JSONDecodeError, Exception):
-            pass
+            score = 3
+            critique = "No critique provided (fallback)."
+            note = ""
 
-        # --- Attempt 2: Robust Anchored Regex Fallback (Fixes "first digit" bug) ---
-        found_count = 0
-        for i in range(n):
-            # Search for "Reason 1: 4" or "Interpretation 1: 4" etc.
-            pattern = rf"(?:Reason|Interpretation|Interp)\s*{i+1}[:\s]*([1-5])"
-            match = re.search(pattern, predicted_text, re.IGNORECASE)
-            if match:
-                scores[i] = int(match.group(1))
-                found_count += 1
+            try:
+                match = re.search(r"\{.*\}", predicted_text, re.DOTALL)
+                if match:
+                    payload = json.loads(match.group(0))
+                    if isinstance(payload, dict):
+                        parsed_score = payload.get("score")
+                        if isinstance(parsed_score, int) and parsed_score in score_scale:
+                            score = parsed_score
+                        else:
+                            parsed_score = int(parsed_score) if str(parsed_score).isdigit() else None
+                            if parsed_score is not None and parsed_score in score_scale:
+                                score = parsed_score
+                        critique = str(payload.get("critique") or critique)
+                        note = f"reason {idx}: parsed JSON score"
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
 
-        if found_count > 0:
-            fallback_note = f"JSON failed; extracted {found_count}/{n} scores via anchored regex."
-        else:
-            # Final fallback: use textual inference for the first reason or just use median
-            fallback_val = _infer_score_from_text(predicted_text, score_scale)
-            if fallback_val is not None:
-                scores = [fallback_val] * n
-                fallback_note = f"All extraction failed; inferred global score {fallback_val} and applied to all."
-            else:
-                fallback_note = "All extraction failed; used neutral prior (3) for all reasons."
+            if score not in score_scale:
+                score_match = re.search(r"(?:score|rating)\s*[:=]\s*([1-5])\b", predicted_text, re.IGNORECASE)
+                if score_match:
+                    parsed_score = int(score_match.group(1))
+                    if parsed_score in score_scale:
+                        score = parsed_score
+                        note = f"reason {idx}: regex score fallback"
 
-        return scores, critiques, fallback_note
+            if score not in score_scale:
+                inferred = _infer_score_from_text(predicted_text, score_scale)
+                if inferred is not None:
+                    score = inferred
+                    note = f"reason {idx}: text score inference"
+                else:
+                    inferred = _infer_score_from_text(str(reason[0]), score_scale)
+                    if inferred is not None:
+                        score = inferred
+                        note = f"reason {idx}: reason text score inference"
+                    else:
+                        score = 3
+                        note = f"reason {idx}: neutral prior fallback"
+
+            if not critique or critique == "No critique provided (fallback).":
+                critique = predicted_text[:200].strip() or "Grounded using scene evidence and the mechanism described in the interpretation."
+
+            scores.append(score)
+            critiques.append(critique)
+            notes.append(note)
+
+        combined_note = "; ".join([n for n in notes if n]) or "Per-reason scoring used: one model call per reason."
+        return scores, critiques, combined_note
 
     # ------------------------------------------------------------------
     # Public API
@@ -704,17 +957,33 @@ class RiskAssessmentEngine:
             if s in score_probs:
                 score_probs[s] += p
 
-        # Enrich reasons detail with individual smart scores and critiques
-        reasons_detail = [
-            {
-                "text": text,
+        # Enrich reasons detail with hazard-structured outputs, while keeping the
+        # rest of the score aggregation pipeline unchanged.
+        reasons_detail = []
+        for (text, p), s, crit in zip(reasons, scores, critiques):
+            hazards = []
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, list):
+                    hazards = parsed
+                elif isinstance(parsed, dict) and isinstance(parsed.get("hazards"), list):
+                    hazards = parsed["hazards"]
+            except (TypeError, ValueError):
+                hazards = [{
+                    "object_id": "unknown",
+                    "hazard_type": "Collision Risk",
+                    "location_relative": "unknown",
+                    "observation": text,
+                    "danger_reasoning": crit,
+                    "actionable_risk": "Maintain defensive speed and reassess the scene.",
+                }]
+
+            reasons_detail.append({
+                "hazards": hazards,
                 "weight": round(p, 4),
                 "sub_score": round(s, 4),
-                "critique": crit,
                 "score_probs": {sk: round(prob, 4) for sk, prob in score_probs.items()},
-            }
-            for (text, p), s, crit in zip(reasons, scores, critiques)
-        ]
+            })
 
         fallback_notes = [fallback_note] if fallback_note else []
 
@@ -774,16 +1043,31 @@ class RiskAssessmentEngine:
             if s in score_probs:
                 score_probs[s] += p
 
-        reasons_detail = [
-            {
-                "text": text,
+        reasons_detail = []
+        for (text, p), s, crit in zip(reasons, scores, critiques):
+            hazards = []
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, list):
+                    hazards = parsed
+                elif isinstance(parsed, dict) and isinstance(parsed.get("hazards"), list):
+                    hazards = parsed["hazards"]
+            except (TypeError, ValueError):
+                hazards = [{
+                    "object_id": "error",
+                    "hazard_type": "error",
+                    "location_relative": "error",
+                    "observation": text,
+                    "danger_reasoning": crit,
+                    "actionable_risk": "error",
+                }]
+
+            reasons_detail.append({
+                "hazards": hazards,
                 "weight": round(p, 4),
                 "sub_score": round(s, 4),
-                "critique": crit,
                 "score_probs": {sk: round(prob, 4) for sk, prob in score_probs.items()},
-            }
-            for (text, p), s, crit in zip(reasons, scores, critiques)
-        ]
+            })
 
         fallback_notes = [fallback_note] if fallback_note else []
 
