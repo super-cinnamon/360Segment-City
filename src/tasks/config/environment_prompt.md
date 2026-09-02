@@ -8,10 +8,15 @@ Analyze the image carefully and output your response ONLY as a single, valid JSO
    - Evaluate the overall density of surrounding vehicle traffic in the visible roadway.
    - Allowed values: "free_flow" (clear road, minimal traffic), "moderate" (steady traffic, ample safe distance), "heavy" (dense traffic, slow-moving, minimal headway), "congested" (stop-and-go or gridlock).
 
-2. NUMBER_OF_LANES:
-   - Estimate the total number of travel lanes present on the current roadway section.
-   - Note: Account for wide-angle lens or panoramic distortion, which can bend straight lane markings. Count unique physical lanes across the roadway structure.
-   - Output format: Integer (e.g., 1, 2, 3, 4, etc.) or null if completely unidentifiable.
+2. LANE_GEOMETRY_AND_MARKINGS:
+   - Analyze the lanes present on the current roadway section.
+   - Output fields:
+     - "number_of_lanes": Integer (e.g., 1, 2, 3, 4, etc.) or null.
+     - "lane_markings": "solid_white | dashed_white | double_yellow | no_markings | mixed".
+     - "lane_type": "standard | merging | splitting | narrowing | dedicated_bike_lane".
+     - "ego_position": "left_edge | center | right_edge | lane_straddling".
+     - "description": Short description of lane layout (e.g., "two lanes with a dashed divider").
+   - Note: Account for wide-angle lens or panoramic distortion. Count unique physical lanes across the roadway structure.
 
 3. ROAD_SURFACE_CONDITION:
    - Identify the primary state and surface type of the roadway.
@@ -51,7 +56,13 @@ Analyze the image carefully and output your response ONLY as a single, valid JSO
 ```json
 {
   "flow_density": "free_flow | moderate | heavy | congested",
-  "number_of_lanes": integer or null,
+  "lane_geometry_and_markings": {
+    "number_of_lanes": integer or null,
+    "lane_markings": "solid_white | dashed_white | double_yellow | no_markings | mixed",
+    "lane_type": "standard | merging | splitting | narrowing | dedicated_bike_lane",
+    "ego_position": "left_edge | center | right_edge | lane_straddling",
+    "description": "string"
+  },
   "road_surface_condition": "dry_asphalt | dry_concrete | wet_surface | damaged_potholes | unpaved_gravel | under_construction",
   "traffic_signs_and_signals": {
     "traffic_light_state": "green | yellow | red | none_visible",

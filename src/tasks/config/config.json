@@ -37,6 +37,7 @@
         "static_labels": [1, 3, 4, 5, 6, 7],
         "score_threshold": 0.8,
         "depth_threshold": 0.9
+        
     },
     "vlm": {
         "ollama": {
@@ -51,11 +52,14 @@
     "processing": {
         "roi_enabled": true,
         "roi_threshold": 0.7,
-        "image_scale": 0.7
+        "image_scale": 0.75,
+        "prune_similar_frames": false,
+        "frame_similarity_threshold": 2.0
     },
     "risk_assessment": {
         "api_base": "http://localhost:5015/v1",
         "model_name": "nvidia/Cosmos3-Nano",
-        "epoch_window_size": 50
+        "epoch_window_size": 60,
+        "n_reasons": 10
     }
 }

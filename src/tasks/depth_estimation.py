@@ -26,13 +26,23 @@ def load_pipeline(
     return pipe
 
 
-# load pipeline
-depth_estimation_pipeline = load_pipeline()
+# Lazy pipeline to avoid consuming GPU at import time
+_depth_estimation_pipeline = None
 
 
-def predict_depth(image, pipe=depth_estimation_pipeline, hyperparameters=CONFIG["depth_estimation"]["hyperparameters"]):
+def _get_depth_pipeline():
+    global _depth_estimation_pipeline
+    if _depth_estimation_pipeline is None:
+        _depth_estimation_pipeline = load_pipeline()
+    return _depth_estimation_pipeline
+
+
+def predict_depth(image, pipe=None, hyperparameters=CONFIG["depth_estimation"]["hyperparameters"]):
     # make image into PIL Image
     input_image = Image.fromarray(image)
+
+    if pipe is None:
+        pipe = _get_depth_pipeline()
 
     with torch.no_grad():
         # Predict depth
@@ -54,10 +64,13 @@ def predict_depth(image, pipe=depth_estimation_pipeline, hyperparameters=CONFIG[
     return depth_colored, depth_pred
 
 
-def predict_depths(images, pipe=depth_estimation_pipeline, hyperparameters=CONFIG["depth_estimation"]["hyperparameters"]):
+def predict_depths(images, pipe=None, hyperparameters=CONFIG["depth_estimation"]["hyperparameters"]):
     depth_output_images = []
     depth_output_predictions = []
     with torch.no_grad():
+        if pipe is None:
+            pipe = _get_depth_pipeline()
+
         for input_image in tqdm(images, desc=f"Estimating depth", leave=True):
             # Predict depth
             depth_output_image, depth_prediction = predict_depth(input_image, pipe, hyperparameters)
@@ -66,28 +79,17 @@ def predict_depths(images, pipe=depth_estimation_pipeline, hyperparameters=CONFI
             depth_output_images.append(depth_output_image)
             depth_output_predictions.append(depth_prediction)
 
-    return depth_output_images, depth_output_predictions
+        return depth_output_images, depth_output_predictions
 
 
-def predict_cubic_depths(cubic_frames, pipe=depth_estimation_pipeline, PARALLEL=False):
-    if PARALLEL:
-        # parallel process all of the sides and recompile them into a list of dicts
-        # use ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            future_left = executor.submit(predict_depths, cubic_frames["left"], pipe)
-            future_right = executor.submit(predict_depths, cubic_frames["right"], pipe)
-            future_front = executor.submit(predict_depths, cubic_frames["front"], pipe)
-            future_back = executor.submit(predict_depths, cubic_frames["back"], pipe)
+def predict_cubic_depths(cubic_frames, pipe=None, PARALLEL=False):
+    if pipe is None:
+        pipe = _get_depth_pipeline()
 
-            left_depths = future_left.result()
-            right_depths = future_right.result()
-            front_depths = future_front.result()
-            back_depths = future_back.result()
-    else:
-        left_depths = predict_depths(cubic_frames["left"], pipe)
-        right_depths = predict_depths(cubic_frames["right"], pipe)
-        front_depths = predict_depths(cubic_frames["front"], pipe)
-        back_depths = predict_depths(cubic_frames["back"], pipe)
+    left_depths = predict_depths(cubic_frames["left"], pipe)
+    right_depths = predict_depths(cubic_frames["right"], pipe)
+    front_depths = predict_depths(cubic_frames["front"], pipe)
+    back_depths = predict_depths(cubic_frames["back"], pipe)
 
     return {
         "left": left_depths,

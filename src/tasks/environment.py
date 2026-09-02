@@ -116,8 +116,11 @@ def query_world_model(prompt=ENV_PROMPT, images=[], model=CONFIG["vlm"]["world_m
 
     # 3. Decode the token IDs back into string output
     response = world_model[1].decode(
-        new_tokens, 
+        new_tokens,
         skip_special_tokens=True
     )
+
+    # Explicitly delete GPU tensors to prevent memory leaks
+    del inputs, outputs, new_tokens
 
     return response

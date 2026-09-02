@@ -42,17 +42,29 @@ class VideoLoader:
     def generate_cubic(self, frames):  
         return generate_cubic(frames)
 
-    def get_split_frames(self, max_to_extract=2000):  # * if you'd like to only work on a sample, slice this list
-        # Backwards-compatible helper that returns up to `max_to_extract` unique frames
-        # starting at the beginning of the video.
-        self.frames = split_frames(self.video_path, max_to_extract)
+    def get_split_frames(self, max_to_extract=2000, prune_similar_frames: Optional[bool] = None):  # * if you'd like to only work on a sample, slice this list
+        # Backwards-compatible helper that returns up to `max_to_extract` frames
+        # starting at the beginning of the video. Pruning is disabled by default.
+        if prune_similar_frames is None:
+            prune_similar_frames = CONFIG["processing"].get("prune_similar_frames", False)
+        self.frames = split_frames(self.video_path, max_to_extract=max_to_extract, prune_similar_frames=prune_similar_frames)
         return self.frames  # [100:200]
 
-    def get_frames_window(self, start_frame: int = 0, max_to_extract: int = 2000, threshold: float = 2.0):
+    def get_frames_window(self, start_frame: int = 0, max_to_extract: int = 2000, threshold: Optional[float] = None, prune_similar_frames: Optional[bool] = None):
         # New helper: returns (frames_list, last_raw_index) for a window starting
         # at `start_frame`. Uses split_frames_window implemented in preprocessing.
         from src.tasks.preprocessing import split_frames_window
-        frames, last_idx = split_frames_window(self.video_path, start_frame=start_frame, threshold=threshold, max_to_extract=max_to_extract)
+        if threshold is None:
+            threshold = CONFIG["processing"].get("frame_similarity_threshold", 2.0)
+        if prune_similar_frames is None:
+            prune_similar_frames = CONFIG["processing"].get("prune_similar_frames", False)
+        frames, last_idx = split_frames_window(
+            self.video_path,
+            start_frame=start_frame,
+            threshold=threshold,
+            max_to_extract=max_to_extract,
+            prune_similar_frames=prune_similar_frames,
+        )
         return frames, last_idx
 
 
@@ -154,8 +166,12 @@ class VideoProcessor:
 
 class SegmentationPipeline:
     def __init__(self, video_path, cubic=True):
+        print("DEBUG: SegmentationPipeline.__init__ start", flush=True)
         self.video_loader = VideoLoader(video_path)
+        print("DEBUG: VideoLoader initialized", flush=True)
         self.video_processor = VideoProcessor(self.video_loader, cubic=cubic)
+        print("DEBUG: VideoProcessor initialized", flush=True)
+        print("DEBUG: SegmentationPipeline.__init__ end", flush=True)
 
     # ! update and fix whatever copilot messed with here and write proper code
     def _get_image_scale(self, image_scale: float | None = None) -> float:
@@ -435,6 +451,7 @@ class SegmentationPipeline:
         risk_result = self.process_risk(
             segmented_items,
             refined_environment_description,
+            frames=prepared_frames,
             telemetry=telemetry,
         )
 
@@ -447,11 +464,12 @@ class SegmentationPipeline:
             "reason": "processed",
         }
 
-    # * the full risk processing pipeline, using sliding window of 50 frames (assuming framerate of gopro is 50)
+    # * the full risk processing pipeline, using sliding window of 60 frames (assuming framerate of gopro is 60)
     def process_risk(
             self,
             segmented_items: list[list[dict]],
             env_description: str,
+            frames:          any = None,
             telemetry: Optional[TelemetryData] = None,
             api_base: str = CONFIG["risk_assessment"]["api_base"],
             model_name: str = CONFIG["risk_assessment"]["model_name"],
@@ -485,5 +503,15 @@ class SegmentationPipeline:
             return engine.assess_epoch(
                 segmented_items=segmented_items,
                 env_description=env_description,
+                frames=frames,
                 telemetry=telemetry,
             )
+
+    def cleanup_gpu(self):
+        """Explicitly clear CUDA cache and perform garbage collection to prevent VRAM leaks."""
+        import torch
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
