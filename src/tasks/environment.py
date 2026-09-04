@@ -79,6 +79,9 @@ def query_world_model(prompt=ENV_PROMPT, images=[], model=CONFIG["vlm"]["world_m
     world_model = load_world_model(model=model)
 
     # Convert images to PIL format
+    print(f"DEBUG: query_world_model images count: {len(images)}")
+    if len(images) > 0:
+        print(f"DEBUG: first image type: {type(images[0])}")
     pil_images = [Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)) for image in images]
 
     # Use the same Hugging Face generation flow on Linux as on Windows.
@@ -122,5 +125,11 @@ def query_world_model(prompt=ENV_PROMPT, images=[], model=CONFIG["vlm"]["world_m
 
     # Explicitly delete GPU tensors to prevent memory leaks
     del inputs, outputs, new_tokens
+
+    # Additional cleanup to ensure VRAM is released
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     return response

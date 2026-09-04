@@ -155,9 +155,8 @@ def build_static_objects_summary(environment_items: Iterable[Sequence[dict]]) ->
             if class_name:
                 counter[class_name] += 1
 
+    # Sort by count descending and limit to top 5
     return [
         {"class_name": class_name, "count": count}
-        for class_name, count in sorted(counter.items())
+        for class_name, count in sorted(counter.items(), key=lambda x: x[1], reverse=True)[:5]
     ]
-
-

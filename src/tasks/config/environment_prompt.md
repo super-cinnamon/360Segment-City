@@ -43,6 +43,7 @@ Analyze the image carefully and output your response ONLY as a single, valid JSO
    - The list below contains static objects detected from the segmentation stage.
    - This list may be empty.
    - Static objects detected in the scene: {STATIC_OBJECTS}
+   - Constraint: When describing the environment, mention at most the 5 most relevant static objects.
 
 8. ENVIRONMENT_RISK_SCORE:
    - Estimate the scene's immediate risk for the rider on a continuous scale from 0.0 to 1.0.

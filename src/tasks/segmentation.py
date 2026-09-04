@@ -25,6 +25,13 @@ def _ensure_segmentation_model():
 
 def predict_segmentation(image, task=CONFIG["segmentation"]["task"]):
     """Predict segmentation for a single image using a lazily-loaded model."""
+    if image is None:
+        print("DEBUG: predict_segmentation received None image")
+        return {"segmentation_map": None, "segmentation_labels": None}
+    if hasattr(image, 'shape') and (image.shape[0] == 0 or image.shape[1] == 0):
+        print(f"DEBUG: predict_segmentation received empty image with shape {image.shape}")
+        return {"segmentation_map": None, "segmentation_labels": None}
+
     _ensure_segmentation_model()
 
     # Use globals

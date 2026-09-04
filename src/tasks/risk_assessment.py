@@ -292,70 +292,78 @@ def _build_epoch_scene_block(
     and multi-camera coverage across the epoch.
     """
     total_frames = len(epoch_agents)
-    all_agents_flat = [a for frame in epoch_agents for a in frame]
+
+    # 1. Limit to 5 closest agents PER FRAME
+    selected_agents = []
+    for frame in epoch_agents:
+        # Sort agents in this specific frame by proximity
+        sorted_frame = sorted(frame, key=lambda a: a.mode_depth)
+        selected_agents.extend(sorted_frame[:5])
+
+    all_agents_flat = selected_agents
     sides_present = sorted(set(a.side for a in all_agents_flat))
 
-    # Group agents across the epoch by class and camera side to trace trajectory
-    tracks: dict[tuple[str, str], list[DetectedAgent]] = {}
-    for frame_idx, frame in enumerate(epoch_agents):
-        for a in frame:
-            key = (a.class_name, a.side)
-            if key not in tracks:
-                tracks[key] = []
-            tracks[key].append(a)
+    # Group agents across the epoch by their unique ID to trace trajectory
+    tracks: dict[str, list[DetectedAgent]] = {}
+    for a in all_agents_flat:
+        key = a.agent_id
+        if key not in tracks:
+            tracks[key] = []
+        tracks[key].append(a)
+
+    # Compute trends for all tracks
+    track_trends = {}
+    for agent_id, occurrences in tracks.items():
+        first = occurrences[0]
+        if len(occurrences) > 1:
+            depth_delta = occurrences[-1].mode_depth - first.mode_depth
+            if depth_delta < -0.05:
+                trend = "APPROACHING / CLOSING IN (HIGHER DANGER)"
+            elif depth_delta > 0.05:
+                trend = "RECEDING / MOVING AWAY"
+            else:
+                trend = "STATIONARY / CONSTANT DISTANCE"
+        else:
+            trend = "TRANSIENT DETECTION"
+        track_trends[agent_id] = trend
 
     image_map = {}
-    if tracks:
-        track_lines = []
-        for (cls_name, side), occurrences in tracks.items():
-            frames_seen = [a.frame for a in occurrences]
-            proximities = [a.distance_weight * 100 for a in occurrences]
-            min_prox = min(proximities)
-            max_prox = max(proximities)
-            first_depth = occurrences[0].mode_depth
-            last_depth = occurrences[-1].mode_depth
+    if selected_agents:
+        # Group the selected agents by frame and side for the prompt
+        groups = {}
+        for a in selected_agents:
+            key = (a.frame, a.side)
+            if key not in groups:
+                groups[key] = []
+            groups[key].append(a)
 
-            if len(occurrences) > 1:
-                depth_delta = last_depth - first_depth
-                if depth_delta < -0.05:
-                    trend = "APPROACHING / CLOSING IN (HIGHER DANGER)"
-                elif depth_delta > 0.05:
-                    trend = "RECEDING / MOVING AWAY"
-                else:
-                    trend = "STATIONARY / CONSTANT DISTANCE"
-            else:
-                trend = "TRANSIENT DETECTION"
+        # Build the block
+        epoch_agent_lines = []
+        for (frame, side) in sorted(groups.keys()):
+            epoch_agent_lines.append(f"  Frame {frame} | Side {side}:")
+            for a in groups[(frame, side)]:
+                trend = track_trends.get(a.agent_id, "UNKNOWN")
+                epoch_agent_lines.append(
+                    f"    • [ID: {a.agent_id}] {a.class_name} | prox: {a.distance_weight * 100:.0f}% | trend: {trend}"
+                )
 
-            frame_span_str = (
-                f"frames {min(frames_seen)}..{max(frames_seen)}"
-                if len(frames_seen) > 1 else f"frame {frames_seen[0]}"
-            )
-            track_lines.append(
-                f"  • Track [ID: {occurrences[0].agent_id}] [{cls_name} on {side}] ({frame_span_str})\n"
-                f"    - Proximity Range: {min_prox:.0f}% to {max_prox:.0f}% (Peak: {max_prox:.0f}%)\n"
-                f"    - Temporal Trend: {trend}"
-            )
+        epoch_agents_block = "\n".join(epoch_agent_lines)
 
-            # Extract image for the peak proximity frame
-            peak_agent = max(occurrences, key=lambda a: a.distance_weight)
-            try:
-                f_idx = peak_agent.frame
-                s = peak_agent.side
-                mask = peak_agent.mask
-                if frames:
-                    frame_img = frames[s][f_idx] if isinstance(frames, dict) else frames[f_idx]
-                    image_map[peak_agent.agent_id] = _crop_agent_image(frame_img, mask)
-            except Exception:
-                pass
-
-            # Only the first occurrence ID is used for the track key usually,
-            # but here we use the actual agent_id for images.
-            # Actually, since we grouped by (class, side), we can just use the
-            # first occurrence's ID to refer to the whole track in the prompt.
-            # Let's use the first occurrence ID for the image_map too if we want 1 image per track.
-            # But let's use the peak agent's ID just to be safe.
-
-        epoch_agents_block = "\n".join(track_lines)
+        # Maintain image map: one image per unique track among the selected agents
+        selected_agent_ids = {a.agent_id for a in selected_agents}
+        for agent_id in selected_agent_ids:
+            if agent_id in tracks:
+                occurrences = tracks[agent_id]
+                peak_agent = max(occurrences, key=lambda a: a.distance_weight)
+                try:
+                    f_idx = peak_agent.frame
+                    s = peak_agent.side
+                    mask = peak_agent.mask
+                    if frames:
+                        frame_img = frames[s][f_idx] if isinstance(frames, dict) else frames[f_idx]
+                        image_map[peak_agent.agent_id] = _crop_agent_image(frame_img, mask)
+                except Exception:
+                    pass
     else:
         epoch_agents_block = "  (no dynamic agents detected across epoch)"
 
@@ -391,26 +399,41 @@ def _build_scene_block(
     sides_present = sorted(set(a.side for a in agents))
     image_map = {}
     if agents:
+        # 1. Sort by proximity (closest first)
+        sorted_agents = sorted(agents, key=lambda a: a.mode_depth)
+
+        # 2. Limit to 5 dynamic agents
+        top_agents = sorted_agents[:5]
+
+        # 3. Group by frame and side
+        groups = {}
+        for a in top_agents:
+            key = (a.frame, a.side)
+            if key not in groups:
+                groups[key] = []
+            groups[key].append(a)
+
         agent_lines = []
-        for a in agents:
-            fused_tag = " [fused]" if a.was_fused else ""
-            agent_lines.append(
-                f"  • [ID: {a.agent_id}] {a.class_name}{fused_tag}"
-                f"  |  side: {a.side}"
-                f"  |  depth: {a.mode_depth:.3f}"
-                f"  |  proximity: {a.distance_weight * 100:.0f}%"
-                f"  |  seg-conf: {a.seg_score * 100:.0f}%"
-            )
-            # Extract image for this agent
-            try:
-                f_idx = a.frame
-                s = a.side
-                mask = a.mask
-                if frames:
-                    frame_img = frames[s][f_idx] if isinstance(frames, dict) else frames[f_idx]
-                    image_map[a.agent_id] = _crop_agent_image(frame_img, mask)
-            except Exception:
-                pass
+        # 4. Build grouped block
+        for (frame, side) in sorted(groups.keys()):
+            agent_lines.append(f"  Frame {frame} | Side {side}:")
+            for a in groups[(frame, side)]:
+                fused_tag = " [fused]" if a.was_fused else ""
+                agent_lines.append(
+                    f"    • [ID: {a.agent_id}] {a.class_name}{fused_tag} "
+                    f"| depth: {a.mode_depth:.3f} | prox: {a.distance_weight * 100:.0f}% "
+                    f"| conf: {a.seg_score * 100:.0f}%"
+                )
+                # Extract image for this agent
+                try:
+                    f_idx = a.frame
+                    s = a.side
+                    mask = a.mask
+                    if frames:
+                        frame_img = frames[s][f_idx] if isinstance(frames, dict) else frames[f_idx]
+                        image_map[a.agent_id] = _crop_agent_image(frame_img, mask)
+                except Exception:
+                    pass
 
         agents_block = "\n".join(agent_lines)
     else:
@@ -542,16 +565,24 @@ def _build_reason_scoring_prompt(scene_block: str, reason: tuple[str, float], re
         "=== RIGID RUBRIC (Use this to determine the score) ===\n"
         "1 = MINIMAL RISK  — Clear road; all agents distant; no action required.\n"
         "2 = LOW RISK      — Light traffic nearby; standard defensive riding applies.\n"
-        "3 = MODERATE RISK — Elevated caution required; one or more agents are close or behaving unpredictably; a speed or position adjustment may be needed.\n"
-        "4 = HIGH RISK     — Significant hazard; braking or evasive manoeuvre likely required soon; collision window is opening.\n"
-        "5 = SEVERE RISK   — Imminent hazard; emergency manoeuvre required right now or collision is unavoidable.\n\n"
+        "3 = MODERATE RISK — Elevated caution required; one or more agents are close "
+        "or behaving unpredictably; a speed or position adjustment may be needed.\n"
+        "4 = HIGH RISK     — Significant hazard; braking or evasive manoeuvre likely "
+        "required soon; collision window is opening.\n"
+        "5 = SEVERE RISK   — Imminent hazard; emergency manoeuvre required right now "
+        "or collision is unavoidable.\n\n"
         "JUDGING RULES:\n"
         "1. Be critical: if the hazard description implies an immediate threat, do not default to 3. Use 4 or 5.\n"
         "2. Be grounded: if the scene data contradicts the interpretation, score it lower.\n"
         "3. Differentiate: avoid assigning a 'neutral' 3 if the evidence strongly points to a specific rubric level.\n"
         "4. Amplify Vulnerability: Scenarios involving children, pedestrians/cyclists in close proximity, or "
         "   unpredictable intent (e.g., facing the road without moving) should strongly push the score toward 4 or 5.\n"
-        "5. Amplify Awareness & Signal Risk: Scenarios where a hazard is closing in while the rider appears unaware (e.g., from a blind spot), or where critical traffic signals (red lights/stop signs) or lane markings are being ignored, should strongly push the score toward 4 or 5.\n\n",
+        "5. Amplify Awareness & Signal Risk: Scenarios where a hazard is closing in while the rider appears unaware (e.g., from a blind spot), or where critical traffic signals (red lights/stop signs) or lane markings are being ignored, should strongly push the score toward 4 or 5.\n"
+        "6. Mapping Logic: A 'Severe Hazard' or 'Imminent Collision' is a Score 5. A 'Clear Road' or 'No Hazard' is a Score 1. Do not invert this logic.\n\n"
+        "PROBABILITY DISTRIBUTION RULES:\n"
+        "1. The values in `score_probs` must sum exactly to 1.0.\n"
+        "2. Concentration: If the evidence strongly supports a specific score, assign the vast majority of the probability (e.g., 0.8 to 1.0) to that specific score.\n"
+        "3. Avoid 'Flat' Distributions: Do not assign minimal equal probabilities (e.g., 0.02 across all) if a clear conclusion can be reached. A distribution should have a clear peak.\n\n",
         "RESPONSE FORMAT:\n"
         "Produce exactly one JSON object. Do not emit any other text, score digits, or commentary outside the JSON.\n"
         "The JSON must follow this schema:\n"
