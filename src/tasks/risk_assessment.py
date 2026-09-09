@@ -36,6 +36,8 @@ import logging
 import cv2
 import base64
 import numpy as np
+import os
+from pathlib import Path
 from openai import OpenAI
 from dataclasses import dataclass, field
 from typing import Optional
@@ -52,6 +54,7 @@ _RA_CFG           = CONFIG["risk_assessment"]
 _DEFAULT_API_BASE = _RA_CFG["api_base"]
 _DEFAULT_MODEL    = _RA_CFG["model_name"]
 _DEFAULT_N        = int(_RA_CFG.get("n_reasons", 5))
+_NORMALIZE_SCORES = _RA_CFG.get("normalize_scores", True)
 
 # ---------------------------------------------------------------------------
 # G-Eval Evaluation Criteria
@@ -285,7 +288,7 @@ def _build_epoch_scene_block(
     epoch_agents:    list[list[DetectedAgent]],
     frames:          any,
     telemetry:       Optional[TelemetryData] = None,
-) -> tuple[str, dict[str, str]]:
+) -> tuple[str, list[dict]]:
     """
     Assembles a temporal scene context block across a sequence/batch of frames
     (an "epoch" sliding window). Shows agent trajectory dynamics, depth trends,
@@ -327,7 +330,7 @@ def _build_epoch_scene_block(
             trend = "TRANSIENT DETECTION"
         track_trends[agent_id] = trend
 
-    image_map = {}
+    multimodal_content = []
     if selected_agents:
         # Group the selected agents by frame and side for the prompt
         groups = {}
@@ -349,21 +352,15 @@ def _build_epoch_scene_block(
 
         epoch_agents_block = "\n".join(epoch_agent_lines)
 
-        # Maintain image map: one image per unique track among the selected agents
+        # Maintain multimodal list: one video per unique track among the selected agents
         selected_agent_ids = {a.agent_id for a in selected_agents}
         for agent_id in selected_agent_ids:
-            if agent_id in tracks:
-                occurrences = tracks[agent_id]
-                peak_agent = max(occurrences, key=lambda a: a.distance_weight)
-                try:
-                    f_idx = peak_agent.frame
-                    s = peak_agent.side
-                    mask = peak_agent.mask
-                    if frames:
-                        frame_img = frames[s][f_idx] if isinstance(frames, dict) else frames[f_idx]
-                        image_map[peak_agent.agent_id] = _crop_agent_image(frame_img, mask)
-                except Exception:
-                    pass
+            try:
+                video_b64 = _generate_agent_bbox_video(agent_id, epoch_agents, frames)
+                if video_b64:
+                    multimodal_content.append({"type": "video", "content": video_b64, "agent_id": agent_id})
+            except Exception:
+                pass
     else:
         epoch_agents_block = "  (no dynamic agents detected across epoch)"
 
@@ -384,7 +381,7 @@ def _build_epoch_scene_block(
         f"{epoch_agents_block}\n\n"
         f"[Physical Telemetry]\n{telemetry_block}"
     )
-    return text, image_map
+    return text, multimodal_content
 
 
 def _build_scene_block(
@@ -392,12 +389,12 @@ def _build_scene_block(
     agents:          list[DetectedAgent],
     frames:          any,
     telemetry:       Optional[TelemetryData],
-) -> tuple[str, dict[str, str]]:
+) -> tuple[str, list[dict]]:
     """
     Assembles the shared scene-context block for single-frame evaluation.
     """
     sides_present = sorted(set(a.side for a in agents))
-    image_map = {}
+    multimodal_content = []
     if agents:
         # 1. Sort by proximity (closest first)
         sorted_agents = sorted(agents, key=lambda a: a.mode_depth)
@@ -431,7 +428,9 @@ def _build_scene_block(
                     mask = a.mask
                     if frames:
                         frame_img = frames[s][f_idx] if isinstance(frames, dict) else frames[f_idx]
-                        image_map[a.agent_id] = _crop_agent_image(frame_img, mask)
+                        img_b64 = _generate_agent_bbox_image(a.agent_id, frame_img, mask)
+                        if img_b64:
+                            multimodal_content.append({"type": "image", "content": img_b64, "agent_id": a.agent_id})
                 except Exception:
                     pass
 
@@ -454,7 +453,7 @@ def _build_scene_block(
         f"{agents_block}\n\n"
         f"[Physical Telemetry]\n{telemetry_block}"
     )
-    return text, image_map
+    return text, multimodal_content
 
 
 def _build_reason_prompt(scene_block: str) -> str:
@@ -490,6 +489,7 @@ def _build_reason_prompt(scene_block: str) -> str:
         "- observation: one concrete, physically grounded sentence describing what is visible or moving. Use terms like\n"
         "  'left-side sedan', 'wet metal seam', 'narrowing gap', 'approaching cyclist', or 'braking lead vehicle'.\n"
         "  Mention specific high-risk details: if it is a child, if the agent is facing the road, or if turn signals are active.\n"
+        "  IMPORTANT: The ego-vehicle getting cut off is a very high risk situation, especially when the ego-rider intends to turn.\n"
         "- danger_reasoning: explain the mechanism in 2-3 detailed clauses: how it threatens the rider, why it matters now "
         "  (e.g., 'child may dart into road', 'facing road suggests imminent entry'), and what specific action is needed. "
         "  Be explicit about vulnerability and unpredictable intent. Do not mention being an AI or discussing the prompt.\n"
@@ -577,12 +577,15 @@ def _build_reason_scoring_prompt(scene_block: str, reason: tuple[str, float], re
         "3. Differentiate: avoid assigning a 'neutral' 3 if the evidence strongly points to a specific rubric level.\n"
         "4. Amplify Vulnerability: Scenarios involving children, pedestrians/cyclists in close proximity, or "
         "   unpredictable intent (e.g., facing the road without moving) should strongly push the score toward 4 or 5.\n"
-        "5. Amplify Awareness & Signal Risk: Scenarios where a hazard is closing in while the rider appears unaware (e.g., from a blind spot), or where critical traffic signals (red lights/stop signs) or lane markings are being ignored, should strongly push the score toward 4 or 5.\n"
-        "6. Mapping Logic: A 'Severe Hazard' or 'Imminent Collision' is a Score 5. A 'Clear Road' or 'No Hazard' is a Score 1. Do not invert this logic.\n\n"
+        "5. Amplify High-Risk Maneuvers: Scenarios where the ego-vehicle is being cut off, especially when the "
+        "   ego-rider intends to turn, should be treated as very high risk and push the score toward 4 or 5.\n"
+        "6. Amplify Awareness & Signal Risk: Scenarios where a hazard is closing in while the rider appears unaware (e.g., from a blind spot), or where critical traffic signals (red lights/stop signs) or lane markings are being ignored, should strongly push the score toward 4 or 5.\n"
+        "7. Mapping Logic: A 'Severe Hazard' or 'Imminent Collision' is a Score 5. A 'Clear Road' or 'No Hazard' is a Score 1. Do not invert this logic.\n\n"
         "PROBABILITY DISTRIBUTION RULES:\n"
         "1. The values in `score_probs` must sum exactly to 1.0.\n"
-        "2. Concentration: If the evidence strongly supports a specific score, assign the vast majority of the probability (e.g., 0.8 to 1.0) to that specific score.\n"
-        "3. Avoid 'Flat' Distributions: Do not assign minimal equal probabilities (e.g., 0.02 across all) if a clear conclusion can be reached. A distribution should have a clear peak.\n\n",
+        "2. Expected Value Calculation: The final risk score is computed as a weighted average. For this reason, the model will calculate an 'expected score' = Σ (score * probability). For example, a distribution of {'4': 0.8, '5': 0.2} results in an expected score of 4.2.\n"
+        "3. Concentration: If the evidence strongly supports a specific score, assign the vast majority of the probability (e.g., 0.8 to 1.0) to that specific score to create a strong, clear signal.\n"
+        "4. Avoid 'Flat' Distributions: Do not assign minimal equal probabilities (e.g., 0.2 across all) unless you are genuinely uncertain. A flat distribution always results in an expected score of 3.0, which dilutes the risk signal and may mask severe hazards or overstate minimal risks.\n\n",
         "RESPONSE FORMAT:\n"
         "Produce exactly one JSON object. Do not emit any other text, score digits, or commentary outside the JSON.\n"
         "The JSON must follow this schema:\n"
@@ -606,7 +609,104 @@ def _build_reason_scoring_prompt(scene_block: str, reason: tuple[str, float], re
 # 4. Helper utilities
 # ---------------------------------------------------------------------------
 
-# ! problematic approach
+VIDEO_CACHE_DIR = Path("outputs/risk_videos")
+
+def _generate_agent_bbox_image(
+    agent_id: str,
+    frame: np.ndarray,
+    mask: np.ndarray
+) -> str:
+    """
+    Generates an image for a specific agent in a single frame.
+    Draws a bounding box and ID around the agent.
+    Returns a base64 JPEG.
+    """
+    if mask is None or not np.any(mask):
+        return ""
+
+    img = frame.copy()
+    coords = np.argwhere(mask)
+    y0, x0 = coords.min(axis=0)
+    y1, x1 = coords.max(axis=0) + 1
+
+    cv2.rectangle(img, (x0, y0), (x1, y1), (0, 255, 0), 2)
+    cv2.putText(img, agent_id, (x0, max(0, y0-10)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+    _, buffer = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+    return base64.b64encode(buffer).decode("utf-8")
+
+def _generate_agent_bbox_video(
+    agent_id: str,
+    epoch_agents: list[list[DetectedAgent]],
+    frames: any
+) -> str:
+    """
+    Generates a video for a specific agent across an epoch.
+    Draws a bounding box and ID on each frame where the agent is present.
+    Caches the video and returns the base64 encoded video string.
+    """
+    VIDEO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    video_path = VIDEO_CACHE_DIR / f"{agent_id}.mp4"
+
+    if video_path.exists():
+        with open(video_path, "rb") as f:
+            return base64.b64encode(f.read()).decode("utf-8")
+
+    # Find all appearances of the agent to determine the primary side
+    agent_appearances = []
+    for f_idx, frame_agents in enumerate(epoch_agents):
+        for a in frame_agents:
+            if a.agent_id == agent_id:
+                agent_appearances.append((f_idx, a))
+                break
+
+    if not agent_appearances:
+        return ""
+
+    # Use the side of the first appearance as the primary side for the video
+    primary_side = agent_appearances[0][1].side
+    side_frames = frames[primary_side] if isinstance(frames, dict) else frames
+
+    if not side_frames:
+        return ""
+
+    video_frames = []
+    for f_idx in range(len(side_frames)):
+        img = side_frames[f_idx].copy()
+
+        # Find the agent in this frame
+        agent_in_frame = next((a for a in epoch_agents[f_idx] if a.agent_id == agent_id), None)
+
+        if agent_in_frame and agent_in_frame.side == primary_side:
+            mask = agent_in_frame.mask
+            if mask is not None and np.any(mask):
+                coords = np.argwhere(mask)
+                y0, x0 = coords.min(axis=0)
+                y1, x1 = coords.max(axis=0) + 1
+
+                # Draw BBox
+                cv2.rectangle(img, (x0, y0), (x1, y1), (0, 255, 0), 2)
+                # Draw ID
+                cv2.putText(img, agent_id, (x0, max(0, y0-10)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+        video_frames.append(img)
+
+    if not video_frames:
+        return ""
+
+    # Save as video
+    h, w, _ = video_frames[0].shape
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(str(video_path), fourcc, 10.0, (w, h))
+    for frame in video_frames:
+        out.write(frame)
+    out.release()
+
+    with open(video_path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
+
 def _infer_score_from_text(text: str, score_scale: Optional[list[int]] = None) -> Optional[int]:
     """Infer a likely score from free-form model output when the model does not emit a clean digit."""
     if not text:
@@ -929,7 +1029,7 @@ class RiskAssessmentEngine:
         self,
         prompt: str,
         temperature: float,
-        images: Optional[list[str]] = None,
+        multimodal_items: Optional[list[dict]] = None,
         max_tokens: int = 8192,
         logprobs: bool = True,
         top_logprobs: Optional[int] = None,
@@ -943,12 +1043,18 @@ class RiskAssessmentEngine:
             try:
                 # Build multimodal content
                 content = [{"type": "text", "text": prompt}]
-                if images:
-                    for img_b64 in images:
-                        content.append({
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}
-                        })
+                if multimodal_items:
+                    for item in multimodal_items:
+                        if item["type"] == "video":
+                            content.append({
+                                "type": "video_url",
+                                "video_url": {"url": f"data:video/mp4;base64,{item['content']}"}
+                            })
+                        else:
+                            content.append({
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/jpeg;base64,{item['content']}"}
+                            })
 
                 response = self.client.chat.completions.create(
                     model       = self.model_name,
@@ -998,7 +1104,7 @@ class RiskAssessmentEngine:
     def _generate_reasons_with_logprobs(
         self,
         scene_block: str,
-        image_map:   dict[str, str] = None,
+        multimodal_items:   list[dict] = None,
     ) -> list[tuple[str, float]]:
         """
         Calls the model N times independently (temperature > 0) to obtain N
@@ -1011,15 +1117,12 @@ class RiskAssessmentEngine:
         reasons_data = []
         mean_lps = []
 
-        # Extract image list from map
-        images = list(image_map.values()) if image_map else None
-
         for i in range(self.n_reasons):
             # Use the retry helper for LLM call and JSON extraction
             response, reason_item = self._call_llm_with_retry(
                 prompt = prompt,
                 temperature = 0.9,
-                images = images,
+                multimodal_items = multimodal_items,
                 logprobs = True,
             )
 
@@ -1087,7 +1190,7 @@ class RiskAssessmentEngine:
         scene_block:  str,
         reasons:      list[tuple[str, float]],
         score_scale:  list[int],
-        image_map:    dict[str, str] = None,
+        multimodal_items: list[dict] = None,
     ) -> tuple[list[dict[int, float]], list[str], str]:
         """
         Score each reason independently with a dedicated model call.
@@ -1104,7 +1207,7 @@ class RiskAssessmentEngine:
             response, payload = self._call_llm_with_retry(
                 prompt = prompt,
                 temperature = 0.2,
-                images = list(image_map.values()) if image_map else None,
+                multimodal_items = multimodal_items,
                 logprobs = True,
                 top_logprobs = 10,
             )
@@ -1274,12 +1377,44 @@ class RiskAssessmentEngine:
         ]
         all_agents_flat = [a for frame in epoch_agents for a in frame]
 
-        scene_block, image_map = _build_epoch_scene_block(env_description, epoch_agents, frames, telemetry)
-        reasons = self._generate_reasons_with_logprobs(scene_block, image_map)
+        scene_block, multimodal_content = _build_epoch_scene_block(env_description, epoch_agents, frames, telemetry)
+
+        # Limit multimodal content to avoid overloading the LLM (top 10 most critical)
+        # multimodal_content is a list of {"type": "video"|"image", "content": b64, "agent_id": id}
+        # We prioritize items with agent_ids that appear most frequently or are closest
+        if len(multimodal_content) > 10:
+            # Simple truncation to top 10 for now
+            multimodal_content = multimodal_content[:10]
+
+        reasons = self._generate_reasons_with_logprobs(scene_block, multimodal_content)
+
+        # If no reasons were generated, return a baseline minimal risk result
+        if not reasons:
+            sides_present = sorted(set(a.side for a in all_agents_flat))
+            closest_agent = min(all_agents_flat, key=lambda a: a.mode_depth) if all_agents_flat else None
+            closest_info = (
+                f"{closest_agent.class_name} @ depth {closest_agent.mode_depth:.3f} "
+                f"(frame: {closest_agent.frame}, side: {closest_agent.side}, proximity: {closest_agent.distance_weight*100:.0f}%)"
+                if closest_agent else "none"
+            )
+            return {
+                "general_risk_score": float(score_scale[0]),
+                "score_probabilities": {s: (1.0 if s == score_scale[0] else 0.0) for s in score_scale},
+                "reasons": [],
+                "fallback_notes": ["No reasons were generated by the model. Falling back to minimal risk."],
+                "context_summary": {
+                    "epoch_frames":         len(segmented_items),
+                    "total_agents_detected": len(all_agents_flat),
+                    "sides_observed":       sides_present,
+                    "closest_agent":        closest_info,
+                    "telemetry_available":  telemetry is not None,
+                    "n_reasons":            self.n_reasons,
+                },
+            }
 
         # HYBRID FUSION: Get score distributions and critiques for each reason
         score_dists, critiques, fallback_note = self._score_synthesized(
-            scene_block, reasons, score_scale, image_map
+            scene_block, reasons, score_scale, multimodal_content
         )
 
         # --- Weight Calculation & Normalization ---
@@ -1391,12 +1526,40 @@ class RiskAssessmentEngine:
         Final Score = Σ [W_final,i * ExpectedScore(D_i)]
         where W_final,i is the normalized product of reason confidence and object distance.
         """
-        scene_block, image_map = _build_scene_block(env_description, agents, frames, telemetry)
-        reasons = self._generate_reasons_with_logprobs(scene_block, image_map)
+        scene_block, multimodal_content = _build_scene_block(env_description, agents, frames, telemetry)
+
+        # Limit multimodal content to avoid overloading the LLM
+        if len(multimodal_content) > 10:
+            multimodal_content = multimodal_content[:10]
+
+        reasons = self._generate_reasons_with_logprobs(scene_block, multimodal_content)
+
+        # If no reasons were generated, return a baseline minimal risk result
+        if not reasons:
+            sides_present = sorted(set(a.side for a in agents))
+            closest_agent = min(agents, key=lambda a: a.mode_depth) if agents else None
+            closest_info = (
+                f"{closest_agent.class_name} @ depth {closest_agent.mode_depth:.3f} "
+                f"(side: {closest_agent.side}, proximity: {closest_agent.distance_weight*100:.0f}%)"
+                if closest_agent else "none"
+            )
+            return {
+                "general_risk_score": float(score_scale[0]),
+                "score_probabilities": {s: (1.0 if s == score_scale[0] else 0.0) for s in score_scale},
+                "reasons": [],
+                "fallback_notes": ["No reasons were generated by the model. Falling back to minimal risk."],
+                "context_summary": {
+                    "agents_count":        len(agents),
+                    "sides_observed":      sides_present,
+                    "closest_agent":       closest_info,
+                    "telemetry_available": telemetry is not None,
+                    "n_reasons":           self.n_reasons,
+                },
+            }
 
         # HYBRID FUSION: Get score distributions and critiques for each reason
         score_dists, critiques, fallback_note = self._score_synthesized(
-            scene_block, reasons, score_scale, image_map
+            scene_block, reasons, score_scale, multimodal_content
         )
 
         # --- Weight Calculation & Normalization ---

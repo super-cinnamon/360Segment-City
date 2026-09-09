@@ -370,24 +370,13 @@ class SegmentationPipeline:
             static_objects=static_objects_summary,
         )
 
-        environment_descriptions = []
-        # run environment by each 10 frames
-        for i in range(0, len(front_frames), 10):  # ! implement tqdm later
-            env_description = query_world_model(
-                prompt=resolved_prompt,
-                images=front_frames[i:i+10],  # ! look into this
-                model=CONFIG["vlm"]["world_model"]["model_name"],
-            )
-            environment_descriptions.append(env_description)
-
-        if not environment_descriptions:
-            return ""
-
-        # normalise to a single string in both cases.
-        if isinstance(environment_descriptions[-1], list):
-            env_description = "\n".join(environment_descriptions[-1])
-        else:
-            env_description = environment_descriptions[-1]
+        # Query the world model using all frames in the epoch as a video sequence
+        # This provides a comprehensive environment description for ROI gating.
+        env_description = query_world_model(
+            prompt=resolved_prompt,
+            images=front_frames,
+            model=CONFIG["vlm"]["world_model"]["model_name"],
+        )
 
         return env_description
 
