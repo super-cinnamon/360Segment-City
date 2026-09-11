@@ -227,10 +227,9 @@ def build_agents_from_segments(
     depth_range = depth_max - depth_min if depth_max > depth_min else 1.0
 
     for idx, seg in enumerate(frame_segments):
-        raw_depth        = float(seg.get("mode_depth", 0.5))
-        clamped          = max(depth_min, min(depth_max, raw_depth))
-        normalized_depth = (clamped - depth_min) / depth_range
-        distance_weight  = round(1.0 - normalized_depth, 4)
+        # Ablation: force constant depth and distance weight
+        raw_depth        = 0.5
+        distance_weight  = 1.0
 
         agent_id = (
             f"{seg.get('side', 'unk')}_"
@@ -256,27 +255,8 @@ def build_agents_from_segments(
 
 # ? normalization of depth across frames of the epoch
 def compute_depth_bounds(segmented_items: list[list[dict]]) -> tuple[float, float]:
-    """
-    Scans the entire batch of frames to find global (min, max) mode_depth values
-    for consistent distance_weight normalisation across all frames.
-
-    Args
-    ----
-    segmented_items : full output of SegmentationPipeline.process_vision().
-
-    Returns
-    -------
-    (depth_min, depth_max)
-    """
-    all_depths = [
-        seg["mode_depth"]
-        for frame in segmented_items
-        for seg in frame
-        if seg.get("mode_depth") is not None
-    ]
-    if not all_depths:
-        return 0.0, 1.0
-    return float(min(all_depths)), float(max(all_depths))
+    # Ablation: return constant range
+    return 0.0, 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -347,7 +327,7 @@ def _build_epoch_scene_block(
             for a in groups[(frame, side)]:
                 trend = track_trends.get(a.agent_id, "UNKNOWN")
                 epoch_agent_lines.append(
-                    f"    • [ID: {a.agent_id}] {a.class_name} | prox: {a.distance_weight * 100:.0f}% | trend: {trend}"
+                    f"    • [ID: {a.agent_id}] {a.class_name} | prox: N/A | trend: {trend}"
                 )
 
         epoch_agents_block = "\n".join(epoch_agent_lines)
@@ -418,7 +398,7 @@ def _build_scene_block(
                 fused_tag = " [fused]" if a.was_fused else ""
                 agent_lines.append(
                     f"    • [ID: {a.agent_id}] {a.class_name}{fused_tag} "
-                    f"| depth: {a.mode_depth:.3f} | prox: {a.distance_weight * 100:.0f}% "
+                    f"| depth: Disabled | prox: N/A "
                     f"| conf: {a.seg_score * 100:.0f}%"
                 )
                 # Extract image for this agent
@@ -1012,18 +992,8 @@ class RiskAssessmentEngine:
         self.n_reasons  = n_reasons
 
     def _get_distance_weight(self, object_id: str, agents: list[DetectedAgent]) -> float:
-        """Retrieves distance weight for an object; defaults to ENVIRONMENT_DISTANCE_WEIGHT."""
-        if not object_id or object_id == "unknown":
-            return ENVIRONMENT_DISTANCE_WEIGHT
-
-        if object_id == "environment":
-            return ENVIRONMENT_DISTANCE_WEIGHT
-
-        for a in agents:
-            if a.agent_id == object_id:
-                return a.distance_weight
-
-        return ENVIRONMENT_DISTANCE_WEIGHT
+        # Ablation: return constant distance weight
+        return 1.0
 
     def _call_llm_with_retry(
         self,
@@ -1233,6 +1203,7 @@ class RiskAssessmentEngine:
             critique = "No critique provided (fallback)."
             note = ""
             dist = {s: 0.0 for s in score_scale}
+            dist_obtained = False
 
             if payload:
                 # JSON found and parsed by the helper
@@ -1269,16 +1240,29 @@ class RiskAssessmentEngine:
                             for s, p in extracted_probs.items():
                                 dist[s] = max(0.0, p - delta)
                             note = f"reason {idx}: distribution weighted-normalized from JSON (sum > 1)"
+                            dist_obtained = True
                         elif total > 0:
                             for s, p in extracted_probs.items():
                                 dist[s] = p
                             note = f"reason {idx}: distribution from JSON"
+                            dist_obtained = True
                         else:
-                            note = f"reason {idx}: JSON probabilities zero"
+                            # Recover from zero probabilities using text inference
+                            recovered_score = _infer_score_from_text(predicted_text, score_scale)
+                            if recovered_score is not None:
+                                dist[recovered_score] = 1.0
+                                note = f"reason {idx}: recovered score {recovered_score} from text (JSON probs zero)"
+                                dist_obtained = True
+                            else:
+                                note = f"reason {idx}: JSON probabilities zero and text recovery failed"
+                    else:
+                        note = f"reason {idx}: No valid scores found in JSON"
 
                 critique = str(payload.get("critique") or critique)
-            else:
-                # JSON not found after 5 retries, fallback to Logprobs
+
+            if not dist_obtained:
+                # JSON not found, or probabilities were zero/missing and text recovery failed
+                # Fallback to Logprobs
                 try:
                     content_logprobs = response.choices[0].logprobs.content
                     if content_logprobs:
@@ -1300,6 +1284,7 @@ class RiskAssessmentEngine:
                             for s, p in zip(score_scale, probs):
                                 dist[s] = float(p)
                             note = f"reason {idx}: distribution from first token"
+                            dist_obtained = True
                         else:
                             score_token_idx = -1
                             for i, tok in enumerate(content_logprobs):
@@ -1318,6 +1303,7 @@ class RiskAssessmentEngine:
                                 for s, p in zip(score_scale, probs):
                                     dist[s] = float(p)
                                 note = f"reason {idx}: distribution from scanned token"
+                                dist_obtained = True
                             else:
                                 dist[3] = 1.0
                                 note = f"reason {idx}: neutral prior fallback"
@@ -1393,8 +1379,8 @@ class RiskAssessmentEngine:
             sides_present = sorted(set(a.side for a in all_agents_flat))
             closest_agent = min(all_agents_flat, key=lambda a: a.mode_depth) if all_agents_flat else None
             closest_info = (
-                f"{closest_agent.class_name} @ depth {closest_agent.mode_depth:.3f} "
-                f"(frame: {closest_agent.frame}, side: {closest_agent.side}, proximity: {closest_agent.distance_weight*100:.0f}%)"
+                f"{closest_agent.class_name} @ depth Disabled "
+                f"(frame: {closest_agent.frame}, side: {closest_agent.side}, proximity: N/A)"
                 if closest_agent else "none"
             )
             return {
@@ -1629,8 +1615,8 @@ class RiskAssessmentEngine:
         sides_present = sorted(set(a.side for a in agents))
         closest_agent = min(agents, key=lambda a: a.mode_depth) if agents else None
         closest_info  = (
-            f"{closest_agent.class_name} @ depth {closest_agent.mode_depth:.3f} "
-            f"(side: {closest_agent.side}, proximity: {closest_agent.distance_weight*100:.0f}%)"
+            f"{closest_agent.class_name} @ depth Disabled "
+            f"(side: {closest_agent.side}, proximity: N/A)"
             if closest_agent else "none"
         )
 

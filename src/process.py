@@ -153,15 +153,8 @@ class VideoProcessor:
         return result
 
     def clean_segmentation(self, depth_masks, segmentation_masks):
-        # get the closest depth mask for the segmentation mask
-        closest_depth_mask = get_closest_depth_mask(depth_masks)
-
-        # clean the segmentation mask using the closest depth mask
-        cleaned_segmentation_masks = []
-        for seg_mask, depth_mask in zip(segmentation_masks, closest_depth_mask):
-            cleaned_mask = seg_mask * depth_mask
-            cleaned_segmentation_masks.append(cleaned_mask)
-        return cleaned_segmentation_masks
+        # Ablation: depth cleaning disabled
+        return segmentation_masks
     
 
 class SegmentationPipeline:
@@ -227,19 +220,7 @@ class SegmentationPipeline:
         return items, static_items
 
     def prune_depth(self, segmented_items, depth_threshold=CONFIG["segmentation"]["depth_threshold"]):
-        for i, frame_segments in enumerate(segmented_items):
-            if not frame_segments:
-                continue
-
-            # Sort closest to furthest
-            sorted_segments = sorted(frame_segments, key=lambda x: x["mode_depth"])
-
-            # Keep elements that fall within valid depth boundary [0.1, depth_threshold)
-            segmented_items[i] = [
-                item for item in sorted_segments 
-                if item["mode_depth"] is not None and 0.1 <= item["mode_depth"] < depth_threshold
-            ]
-
+        # Ablation: depth pruning disabled
         return segmented_items
 
     def process_vision(self, object_name=None, image_scale: float | None = None):
@@ -277,8 +258,9 @@ class SegmentationPipeline:
             segmented_items.append(frame_segments)
             environment_items.append(environment_segments)
         # prune segmentation items based on depth
-        segmented_items = self.prune_depth(segmented_items)         
-        environment_items = self.prune_depth(environment_items)
+        # Ablation: disabled
+        pass
+        pass
       
         return segmented_items, environment_items
 
@@ -336,8 +318,9 @@ class SegmentationPipeline:
             segmented_items.append(frame_segments)
             environment_items.append(environment_segments)
         # prune segmentation items based on depth
-        segmented_items = self.prune_depth(segmented_items)
-        environment_items = self.prune_depth(environment_items)
+        # Ablation: disabled
+        pass
+        pass
 
         return segmented_items, environment_items
 

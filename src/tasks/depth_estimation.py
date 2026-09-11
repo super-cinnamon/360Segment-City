@@ -38,111 +38,41 @@ def _get_depth_pipeline():
 
 
 def predict_depth(image, pipe=None, hyperparameters=CONFIG["depth_estimation"]["hyperparameters"]):
-    # make image into PIL Image
-    input_image = Image.fromarray(image)
-
-    if pipe is None:
-        pipe = _get_depth_pipeline()
-
-    with torch.no_grad():
-        # Predict depth
-        pipeline_output = pipe(
-            input_image,
-            denoising_steps=hyperparameters["denoising_steps"],     # optional
-            ensemble_size=hyperparameters["ensemble_size"],       # optional
-            processing_res=hyperparameters["processing_res"],     # optional
-            match_input_res=hyperparameters["match_input_res"],   # optional
-            batch_size=0,           # optional
-            color_map="Spectral",   # optional
-            show_progress_bar=True, # optional
-            # seed=seed,              # optional
-        )
-
-        depth_pred: np.ndarray = pipeline_output.depth_np
-        depth_colored: Image.Image = pipeline_output.depth_colored
-
+    # Ablation: depth estimation disabled
+    depth_pred = np.full(image.shape[:2], 0.5)
+    depth_colored = Image.new('RGB', (image.shape[1], image.shape[0]), (0, 0, 0))
     return depth_colored, depth_pred
 
 
 def predict_depths(images, pipe=None, hyperparameters=CONFIG["depth_estimation"]["hyperparameters"]):
     depth_output_images = []
     depth_output_predictions = []
-    with torch.no_grad():
-        if pipe is None:
-            pipe = _get_depth_pipeline()
+    for input_image in tqdm(images, desc=f"Estimating depth (Ablation: Disabled)", leave=True):
+        # Ablation: generate dummy values
+        depth_output_image = Image.new('RGB', (input_image.shape[1], input_image.shape[0]), (0, 0, 0))
+        depth_output_prediction = np.full(input_image.shape[:2], 0.5)
+        depth_output_images.append(depth_output_image)
+        depth_output_predictions.append(depth_output_prediction)
 
-        for input_image in tqdm(images, desc=f"Estimating depth", leave=True):
-            # Predict depth
-            depth_output_image, depth_prediction = predict_depth(input_image, pipe, hyperparameters)
-
-            # Save to the list
-            depth_output_images.append(depth_output_image)
-            depth_output_predictions.append(depth_prediction)
-
-        return depth_output_images, depth_output_predictions
+    return depth_output_images, depth_output_predictions
 
 
 def predict_cubic_depths(cubic_frames, pipe=None, PARALLEL=False):
-    if pipe is None:
-        pipe = _get_depth_pipeline()
-
-    left_depths = predict_depths(cubic_frames["left"], pipe)
-    right_depths = predict_depths(cubic_frames["right"], pipe)
-    front_depths = predict_depths(cubic_frames["front"], pipe)
-    back_depths = predict_depths(cubic_frames["back"], pipe)
-
+    # Ablation: return dummy depths for all sides
     return {
-        "left": left_depths,
-        "right": right_depths,
-        "front": front_depths,
-        "back": back_depths,
+        side: predict_depths(frames)
+        for side, frames in cubic_frames.items()
     }
 
 
 def get_closest_depth_mask(depth_images, threshold=10):
-    combined_mask = None
-
-    for heatmap in depth_images:
-        # 1. Ensure Grayscale
-        if len(heatmap.shape) == 3:
-            # Using the Green channel as per your original logic [:, :, 1]
-            heatmap_gray = heatmap[:, :, 1]
-        else:
-            heatmap_gray = heatmap
-
-        # 2. Threshold each heatmap
-        _, current_mask = cv2.threshold(heatmap_gray, thresh=threshold, maxval=255, type=cv2.THRESH_BINARY_INV)
-
-        # 3. Combine masks using Bitwise AND (Intersection)
-        if combined_mask is None:
-            combined_mask = current_mask
-        else:
-            combined_mask = cv2.bitwise_and(combined_mask, current_mask)
-
-    # 4. Refine the final consensus mask
-    if combined_mask is not None:
-        kernel = np.ones((20, 20), np.uint8)
-        # Close holes to make solid chunks
-        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel)
-        # Dilate to expand the mask slightly
-        combined_mask = cv2.dilate(combined_mask, kernel, iterations=2)
-    
-    return combined_mask
+    # Ablation: return mask of ones to avoid pruning segmentation
+    if not depth_images:
+        return None
+    first_img = depth_images[0]
+    return np.ones(first_img.shape[:2], dtype=np.uint8) * 255
 
 
 def mode_depth(depth_map, segmentation_mask):
-    # Ensure your mask is a boolean array (True for object pixels, False for background)
-    binary_mask = segmentation_mask > 0
-
-    # Filter depth map using the mask (returns a 1D array of depth values)
-    object_depths = depth_map[binary_mask]
-
-    # Round to discrete levels so identical float values can group up for a mode calculation
-    binned_depths = np.round(object_depths, decimals=2)
-
-    # Get the mode depth of the object
-    mode_depth = stats.mode(binned_depths, keepdims=False).mode
-
-
-    return mode_depth
-
+    # Ablation: return constant depth
+    return 0.5
