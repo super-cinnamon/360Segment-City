@@ -362,7 +362,16 @@ def _build_epoch_scene_block(
             except Exception:
                 pass
     else:
-        epoch_agents_block = "  (no dynamic agents detected across epoch)"
+        epoch_agents_block = "  (no dynamic agents detected; providing full side videos for context)"
+        if frames and isinstance(frames, dict):
+            for side in frames.keys():
+                try:
+                    video_b64 = _generate_side_video(side, frames)
+                    if video_b64:
+                        multimodal_content.append({"type": "video", "content": video_b64, "agent_id": f"side_{side}"})
+                except Exception:
+                    pass
+
 
     if telemetry is not None:
         telemetry_block = (
@@ -695,6 +704,38 @@ def _generate_agent_bbox_video(
 
     if not video_frames:
         return ""
+
+    # Save as video
+    h, w, _ = video_frames[0].shape
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(str(video_path), fourcc, 10.0, (w, h))
+    for frame in video_frames:
+        out.write(frame)
+    out.release()
+
+    with open(video_path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
+
+def _generate_side_video(
+    side: str,
+    frames: any
+) -> str:
+    """
+    Generates a full-frame video for a specific camera side across an epoch.
+    Caches the video and returns the base64 encoded video string.
+    """
+    VIDEO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    video_path = VIDEO_CACHE_DIR / f"side_{side}.mp4"
+
+    # Use side_frames from the prepared_frames dict
+    side_frames = frames[side] if isinstance(frames, dict) else frames
+
+    if not side_frames:
+        return ""
+
+    video_frames = []
+    for img in side_frames:
+        video_frames.append(img.copy())
 
     # Save as video
     h, w, _ = video_frames[0].shape
@@ -1360,22 +1401,13 @@ class RiskAssessmentEngine:
         4. Weights are normalized: W_final,i = W_raw,i / Sum(W_raw).
         5. Final Score = Sum(W_final,i * ExpectedScore(D_i)).
         """
-        if not segmented_items:
-            return {
-                "expected_risk_score": 1.0,
-                "final_score": 1.0,
-                "score_probabilities": {s: (1.0 if s == 1 else 0.0) for s in score_scale},
-                "reasons": [],
-                "fallback_notes": ["Empty segmented items batch provided."],
-                "context_summary": {"frame_count": 0},
-            }
-
         depth_min, depth_max = compute_depth_bounds(segmented_items)
         epoch_agents = [
             build_agents_from_segments(frame_segs, depth_min=depth_min, depth_max=depth_max)
             for frame_segs in segmented_items
         ]
         all_agents_flat = [a for frame in epoch_agents for a in frame]
+
 
         scene_block, multimodal_content = _build_epoch_scene_block(env_description, epoch_agents, frames, telemetry)
 
@@ -1439,7 +1471,10 @@ class RiskAssessmentEngine:
                     oid = "environment"
 
             reason_object_ids.append(oid)
-            dist_w = self._get_distance_weight(oid, all_agents_flat)
+            if not all_agents_flat:
+                dist_w = 1.0
+            else:
+                dist_w = self._get_distance_weight(oid, all_agents_flat)
             raw_weights.append(p * dist_w)
 
         sum_raw = sum(raw_weights) if raw_weights else 1.0

@@ -9,12 +9,6 @@ from src.tasks.preprocessing import (
     split_frames,
     generate_cubic,
 )
-from src.tasks.depth_estimation import (
-    predict_depths,
-    get_closest_depth_mask,
-    predict_cubic_depths,
-    mode_depth,
-)
 from src.tasks.segmentation import predict_segmentations, predict_cubic_segmentations
 from src.tasks.environment import query_world_model
 from src.tasks.risk_assessment import (
@@ -95,74 +89,6 @@ class VideoProcessor:
 
         return cache_dir / f"{prefix}_{video_name}_{idx_str}.pkl"
 
-    def get_depth_mask(self):
-        # Backwards-compatible no-arg form: use preloaded frames if present.
-        if self.cubic:
-            frames = self.cubic_frames
-            depths = predict_cubic_depths(frames)
-            return depths
-        else:
-            frames = self.video_loader.frames
-            depths = predict_depths(frames)
-            return depths
-
-    def get_depth_mask_for(self, frames, epoch_idx=None, raw_start=None, raw_end=None):
-        # New API: compute depths for either cubic dict or list of frames
-        cache_path = self._get_cache_path("depth", epoch_idx, raw_start, raw_end)
-        if cache_path and cache_path.exists():
-            with open(cache_path, "rb") as f:
-                return pickle.load(f)
-
-        if self.cubic:
-            result = predict_cubic_depths(frames)
-        else:
-            result = predict_depths(frames)
-
-        if cache_path:
-            with open(cache_path, "wb") as f:
-                pickle.dump(result, f)
-
-        return result
-
-    def segment(self, object_name=None):
-        # for this model there is no object name so we ignore for now
-        if self.cubic:
-            frames = self.cubic_frames
-            segmentation_masks = predict_cubic_segmentations(frames)
-            return segmentation_masks
-        frames = self.video_loader.frames
-        segmentation_masks = predict_segmentations(frames)
-        return segmentation_masks
-
-    def segment_for(self, frames, object_name=None, epoch_idx=None, raw_start=None, raw_end=None):
-        # New API: segmentation for provided frames (either cubic dict or list)
-        cache_path = self._get_cache_path("seg", epoch_idx, raw_start, raw_end)
-        if cache_path and cache_path.exists():
-            with open(cache_path, "rb") as f:
-                return pickle.load(f)
-
-        if self.cubic:
-            result = predict_cubic_segmentations(frames)
-        else:
-            result = predict_segmentations(frames)
-
-        if cache_path:
-            with open(cache_path, "wb") as f:
-                pickle.dump(result, f)
-
-        return result
-
-    def clean_segmentation(self, depth_masks, segmentation_masks):
-        # get the closest depth mask for the segmentation mask
-        closest_depth_mask = get_closest_depth_mask(depth_masks)
-
-        # clean the segmentation mask using the closest depth mask
-        cleaned_segmentation_masks = []
-        for seg_mask, depth_mask in zip(segmentation_masks, closest_depth_mask):
-            cleaned_mask = seg_mask * depth_mask
-            cleaned_segmentation_masks.append(cleaned_mask)
-        return cleaned_segmentation_masks
-    
 
 class SegmentationPipeline:
     def __init__(self, video_path, cubic=True):
@@ -202,144 +128,6 @@ class SegmentationPipeline:
                 for side, face_frames in cubic_frames.items()
             }
         return resize_frames(frames, scale=scale)
-
-    def prune_segmentation(
-            self,
-            items,
-            score_threshold=CONFIG["segmentation"]["score_threshold"],
-            dynamic_labels=CONFIG["segmentation"]["dynamic_labels"],
-            static_labels=CONFIG["segmentation"]["static_labels"]
-        ):
-        """
-        This method aims to prune out all segmentation masks that show a score below the given threshold.
-        And also to prune out any label that is irrelevant to our needs. Both are given as input, and will 
-        default to the config file defaults.
-        This processes a single frame of segmentation items, and returns the pruned list of items.
-        """
-
-        items = [
-            item for item in items 
-            if item["score"] >= score_threshold and item["class_id"] in dynamic_labels
-        ]
-
-        static_items = [item for item in items if item["class_id"] in static_labels]
-
-        return items, static_items
-
-    def prune_depth(self, segmented_items, depth_threshold=CONFIG["segmentation"]["depth_threshold"]):
-        for i, frame_segments in enumerate(segmented_items):
-            if not frame_segments:
-                continue
-
-            # Sort closest to furthest
-            sorted_segments = sorted(frame_segments, key=lambda x: x["mode_depth"])
-
-            # Keep elements that fall within valid depth boundary [0.1, depth_threshold)
-            segmented_items[i] = [
-                item for item in sorted_segments 
-                if item["mode_depth"] is not None and 0.1 <= item["mode_depth"] < depth_threshold
-            ]
-
-        return segmented_items
-
-    def process_vision(self, object_name=None, image_scale: float | None = None):
-        # Backwards-compatible default behaviour (no frames provided): run as before
-        if self.video_loader.frames is None:
-            self.video_loader.frames = self.video_loader.get_split_frames()
-
-        prepared_frames = self._prepare_frames_for_inference(self.video_loader.frames, image_scale=image_scale)
-        depth_masks = self.video_processor.get_depth_mask_for(prepared_frames)
-        segmentation_masks = self.video_processor.segment_for(prepared_frames, object_name)
-        # create the list of segmented items with their class names and which frame they belong to
-        segmented_items = []
-        environment_items = []
-        for i in range (len(segmentation_masks["front"])): # looping through frames
-            frame_segments = []
-            for key in segmentation_masks.keys():  # looping through sides
-                for segment_info in segmentation_masks[key][i]["segmentation_labels"]:  # loop through segmented items
-                    # Retrieve human-readable class name from model's id2label mapping
-                    class_name = CONFIG["segmentation"]["id2label"].get(str(segment_info["label_id"]), f"Class_{segment_info['label_id']}")
-                    binary_mask = (segmentation_masks[key][i]["segmentation_map"] == segment_info["id"])
-                    # calculate the mode of the depth for this object
-                    mode_depth_value = mode_depth(depth_masks[key][1][i], binary_mask) # ! this part needs to be switched to take more frames not just current
-                    frame_segments.append({
-                        "frame": i,
-                        "side": key,
-                        "class_name": class_name,
-                        "class_id": segment_info["label_id"],
-                        "score": segment_info.get("score", None),
-                        "was_fused": segment_info.get("was_fused", False),
-                        "mask": binary_mask,
-                        "mode_depth": mode_depth_value,
-                    })
-            # prune segmentation items based on score and relevant labels
-            frame_segments, environment_segments = self.prune_segmentation(frame_segments)
-            segmented_items.append(frame_segments)
-            environment_items.append(environment_segments)
-        # prune segmentation items based on depth
-        segmented_items = self.prune_depth(segmented_items)         
-        environment_items = self.prune_depth(environment_items)
-      
-        return segmented_items, environment_items
-
-    # * is the same as the function i wrote above, but just takes specific frames as input, above function will be removed later
-    def process_vision_for(self, frames, object_name=None, prepared_frames=None, image_scale: float | None = None, epoch_idx=None, raw_start=None, raw_end=None):
-        """
-        Process a provided list of frames (or cubic dict) and return segmented items.
-        This allows sliding-window processing without changing the core logic.
-        """
-        if prepared_frames is None:
-            prepared_frames = self._prepare_frames_for_inference(frames, image_scale=image_scale)
-
-        # compute depth masks and segmentation masks for provided frames
-        if self.video_processor.cubic:
-            depth_masks = self.video_processor.get_depth_mask_for(
-                prepared_frames, epoch_idx=epoch_idx, raw_start=raw_start, raw_end=raw_end
-            )
-            segmentation_masks = self.video_processor.segment_for(
-                prepared_frames, object_name, epoch_idx=epoch_idx, raw_start=raw_start, raw_end=raw_end
-            )
-            frames_front = prepared_frames["front"]
-        else:
-            depth_masks = self.video_processor.get_depth_mask_for(
-                prepared_frames, epoch_idx=epoch_idx, raw_start=raw_start, raw_end=raw_end
-            )
-            segmentation_masks = self.video_processor.segment_for(
-                prepared_frames, object_name, epoch_idx=epoch_idx, raw_start=raw_start, raw_end=raw_end
-            )
-            frames_front = prepared_frames
-
-        # create the list of segmented items with their class names and which frame they belong to
-        segmented_items = []
-        environment_items = []
-        for i in range (len(segmentation_masks["front"])): # looping through frames
-            frame_segments = []
-            for key in segmentation_masks.keys():  # looping through sides
-                for segment_info in segmentation_masks[key][i]["segmentation_labels"]:  # loop through segmented items
-                    # Retrieve human-readable class name from model's id2label mapping
-                    class_name = CONFIG["segmentation"]["id2label"].get(str(segment_info["label_id"]), f"Class_{segment_info['label_id']}")
-                    binary_mask = (segmentation_masks[key][i]["segmentation_map"] == segment_info["id"])
-                    # calculate the mode of the depth for this object
-                    mode_depth_value = mode_depth(depth_masks[key][1][i], binary_mask) # ! this part needs to be switched to take more frames not just current
-                    frame_segments.append({
-                        "frame": i,
-                        "side": key,
-                        "class_name": class_name,
-                        "class_id": segment_info["label_id"],
-                        "score": segment_info.get("score", None),
-                        "was_fused": segment_info.get("was_fused", False),
-                        "mask": binary_mask,
-                        "mode_depth": mode_depth_value,
-                    })
-            # prune segmentation items based on score and relevant labels
-            frame_segments, environment_segments = self.prune_segmentation(frame_segments)
-            segmented_items.append(frame_segments)
-            environment_items.append(environment_segments)
-        # prune segmentation items based on depth
-        segmented_items = self.prune_depth(segmented_items)
-        environment_items = self.prune_depth(environment_items)
-
-        return segmented_items, environment_items
 
     # * here is where the environment description is generated, the detected static elements will be added here next time
     def process_environment(self, static_objects=None, prompt: str = ENV_PROMPT) -> str:
@@ -422,21 +210,10 @@ class SegmentationPipeline:
                 "reason": "skip_low_roi",
             }
 
-        segmented_items, environment_items = self.process_vision_for(
-            frames,
-            object_name=object_name,
-            prepared_frames=prepared_frames,
-            epoch_idx=epoch_idx,
-            raw_start=raw_start,
-            raw_end=raw_end,
-        )
-        static_objects = build_static_objects_summary(environment_items)
-        refined_environment_description = self.process_environment_for(
-            frames,
-            static_objects=static_objects,
-            prompt=prompt,
-            prepared_frames=prepared_frames,
-        )
+        # In ablation mode, we bypass segmentation and agent tracking
+        segmented_items = []
+        environment_items = []
+        refined_environment_description = environment_description
         risk_result = self.process_risk(
             segmented_items,
             refined_environment_description,

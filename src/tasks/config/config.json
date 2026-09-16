@@ -1,14 +1,4 @@
 {
-    "depth_estimation": {
-        "model_name": "prs-eth/marigold-lcm-v1-0",
-        "pipeline_name": "marigold_depth_estimation",
-        "hyperparameters": {
-            "denoising_steps": 4,
-            "ensemble_size": 5,
-            "processing_res": 768,
-            "match_input_res": true
-        }
-    },
     "segmentation": {
         "model_name": "shi-labs/oneformer_cityscapes_swin_large",
         "task": "panoptic",
@@ -54,7 +44,8 @@
         "roi_threshold": 0.7,
         "image_scale": 0.4,
         "prune_similar_frames": false,
-        "frame_similarity_threshold": 2.0
+        "frame_similarity_threshold": 2.0,
+        "ablation_mode": "no_seg"
     },
     "risk_assessment": {
         "api_base": "http://localhost:5015/v1",
