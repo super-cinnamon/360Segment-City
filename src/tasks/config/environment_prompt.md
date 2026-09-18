@@ -8,10 +8,15 @@ Analyze the image carefully and output your response ONLY as a single, valid JSO
    - Evaluate the overall density of surrounding vehicle traffic in the visible roadway.
    - Allowed values: "free_flow" (clear road, minimal traffic), "moderate" (steady traffic, ample safe distance), "heavy" (dense traffic, slow-moving, minimal headway), "congested" (stop-and-go or gridlock).
 
-2. NUMBER_OF_LANES:
-   - Estimate the total number of travel lanes present on the current roadway section.
-   - Note: Account for wide-angle lens or panoramic distortion, which can bend straight lane markings. Count unique physical lanes across the roadway structure.
-   - Output format: Integer (e.g., 1, 2, 3, 4, etc.) or null if completely unidentifiable.
+2. LANE_GEOMETRY_AND_MARKINGS:
+   - Analyze the lanes present on the current roadway section.
+   - Output fields:
+     - "number_of_lanes": Integer (e.g., 1, 2, 3, 4, etc.) or null.
+     - "lane_markings": "solid_white | dashed_white | double_yellow | no_markings | mixed".
+     - "lane_type": "standard | merging | splitting | narrowing | dedicated_bike_lane".
+     - "ego_position": "left_edge | center | right_edge | lane_straddling".
+     - "description": Short description of lane layout (e.g., "two lanes with a dashed divider").
+   - Note: Account for wide-angle lens or panoramic distortion. Count unique physical lanes across the roadway structure.
 
 3. ROAD_SURFACE_CONDITION:
    - Identify the primary state and surface type of the roadway.
@@ -34,6 +39,17 @@ Analyze the image carefully and output your response ONLY as a single, valid JSO
    - Evaluate the primary ambient lighting environment.
    - Allowed values: "daylight", "dusk_dawn", "night_well_lit" (nighttime with functional streetlights), "night_dark" (nighttime with minimal/no artificial lighting).
 
+7. STATIC_OBJECTS_CONTEXT:
+   - The list below contains static objects detected from the segmentation stage.
+   - This list may be empty.
+   - Static objects detected in the scene: {STATIC_OBJECTS}
+   - Constraint: When describing the environment, mention at most the 5 most relevant static objects.
+
+8. ENVIRONMENT_RISK_SCORE:
+   - Estimate the scene's immediate risk for the rider on a continuous scale from 0.0 to 1.0.
+   - Use 0.0 for very low-risk, clear-road scenes and 1.0 for very high-risk scenes.
+   - Consider traffic density, pedestrians, crossings, traffic signals, road complexity, weather, visibility, and proximity of nearby road users.
+
 ---
 
 ### Strict JSON Output Schema
@@ -41,7 +57,13 @@ Analyze the image carefully and output your response ONLY as a single, valid JSO
 ```json
 {
   "flow_density": "free_flow | moderate | heavy | congested",
-  "number_of_lanes": integer or null,
+  "lane_geometry_and_markings": {
+    "number_of_lanes": integer or null,
+    "lane_markings": "solid_white | dashed_white | double_yellow | no_markings | mixed",
+    "lane_type": "standard | merging | splitting | narrowing | dedicated_bike_lane",
+    "ego_position": "left_edge | center | right_edge | lane_straddling",
+    "description": "string"
+  },
   "road_surface_condition": "dry_asphalt | dry_concrete | wet_surface | damaged_potholes | unpaved_gravel | under_construction",
   "traffic_signs_and_signals": {
     "traffic_light_state": "green | yellow | red | none_visible",
@@ -50,5 +72,6 @@ Analyze the image carefully and output your response ONLY as a single, valid JSO
   },
   "weather_conditions": "clear_sunny | overcast_cloudy | rainy | foggy_hazy",
   "lighting_conditions": "daylight | dusk_dawn | night_well_lit | night_dark",
+  "environment_risk_score": 0.0,
   "confidence_notes": "Short string noting any ambiguity caused by glare, occlusion, or camera distortion (optional, keep under 15 words)."
 }

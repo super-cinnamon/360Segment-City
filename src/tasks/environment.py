@@ -1,4 +1,5 @@
 # using ollama as a first base, we will get environment descriptions
+# ! try other models
 import multiprocessing as mp
 import os
 import sys
@@ -73,10 +74,14 @@ def load_world_model(model=CONFIG["vlm"]["world_model"]["model_name"]):
 
 # * here we query the world model to describe the environment, we will be adding the segmentation of the static objects in the prompt here, will be completed next time
 def query_world_model(prompt=ENV_PROMPT, images=[], model=CONFIG["vlm"]["world_model"]["model_name"]):
+    # ! add here the static objects from segmentation
     # Load the world model
     world_model = load_world_model(model=model)
 
     # Convert images to PIL format
+    print(f"DEBUG: query_world_model images count: {len(images)}")
+    if len(images) > 0:
+        print(f"DEBUG: first image type: {type(images[0])}")
     pil_images = [Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)) for image in images]
 
     # Use the same Hugging Face generation flow on Linux as on Windows.
@@ -114,8 +119,17 @@ def query_world_model(prompt=ENV_PROMPT, images=[], model=CONFIG["vlm"]["world_m
 
     # 3. Decode the token IDs back into string output
     response = world_model[1].decode(
-        new_tokens, 
+        new_tokens,
         skip_special_tokens=True
     )
+
+    # Explicitly delete GPU tensors to prevent memory leaks
+    del inputs, outputs, new_tokens
+
+    # Additional cleanup to ensure VRAM is released
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     return response

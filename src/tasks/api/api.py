@@ -80,7 +80,8 @@ async def create_chat_completion(request: ChatCompletionRequest):
         log_probs = torch.log_softmax(first_token_scores, dim=-1)
 
         # Extract top-k logprobs
-        top_k_values, top_k_indices = torch.topk(log_probs, k=request.top_logprobs)
+        k_val = request.top_logprobs if request.top_logprobs is not None else 10
+        top_k_values, top_k_indices = torch.topk(log_probs, k=k_val)
         
         top_logprobs_list = []
         for val, idx in zip(top_k_values, top_k_indices):

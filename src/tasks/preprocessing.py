@@ -1,17 +1,25 @@
 import os
 from pathlib import Path
+from typing import Optional
 
 import cv2
 import numpy as np
 from tqdm import tqdm
 import py360convert
 
+from src.tasks.config.utils import CONFIG
+
 
 def load_video():
     pass
 
 
-def split_frames(video_path, threshold=2.0, max_to_extract=2000):
+def split_frames(video_path, threshold=None, max_to_extract=2000, prune_similar_frames: Optional[bool] = None):
+    if threshold is None:
+        threshold = CONFIG["processing"].get("frame_similarity_threshold", 2.0)
+    if prune_similar_frames is None:
+        prune_similar_frames = CONFIG["processing"].get("prune_similar_frames", False)
+
     cap = cv2.VideoCapture(video_path)
     unique_frames = []
     last_frame_gray = None
@@ -21,17 +29,18 @@ def split_frames(video_path, threshold=2.0, max_to_extract=2000):
         if not ret or len(unique_frames) >= max_to_extract:
             break
 
-        # Convert to grayscale for comparison logic
         gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        if last_frame_gray is None:
-            is_different = True
+        if prune_similar_frames:
+            if last_frame_gray is None:
+                is_different = True
+            else:
+                mse = np.mean((gray_frame.astype("float") - last_frame_gray.astype("float")) ** 2)
+                is_different = mse > threshold
         else:
-            mse = np.mean((gray_frame.astype("float") - last_frame_gray.astype("float")) ** 2)
-            is_different = mse > threshold
+            is_different = True
 
         if is_different:
-            # Store the COLOR frame, but convert BGR to RGB for Matplotlib
             unique_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             last_frame_gray = gray_frame
 
@@ -40,16 +49,21 @@ def split_frames(video_path, threshold=2.0, max_to_extract=2000):
     return unique_frames
 
 
-def split_frames_window(video_path, start_frame=0, threshold=2.0, max_to_extract=2000):
+def split_frames_window(video_path, start_frame=0, threshold=None, max_to_extract=2000, prune_similar_frames: Optional[bool] = None):
     """
     Reads a video starting at `start_frame` (0-based raw frame index) and
     extracts up to `max_to_extract` unique frames using the same uniqueness
-    thresholding logic as `split_frames`.
+    thresholding logic as `split_frames` unless frame pruning is disabled.
 
     Returns a tuple `(unique_frames, last_raw_index)` where `last_raw_index` is
     the last raw frame index read from the video (0-based). If EOF is reached
     immediately, returns ([], None).
     """
+    if threshold is None:
+        threshold = CONFIG["processing"].get("frame_similarity_threshold", 2.0)
+    if prune_similar_frames is None:
+        prune_similar_frames = CONFIG["processing"].get("prune_similar_frames", False)
+
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     if start_frame >= total_frames:
@@ -74,11 +88,14 @@ def split_frames_window(video_path, start_frame=0, threshold=2.0, max_to_extract
 
         gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        if last_frame_gray is None:
-            is_different = True
+        if prune_similar_frames:
+            if last_frame_gray is None:
+                is_different = True
+            else:
+                mse = np.mean((gray_frame.astype("float") - last_frame_gray.astype("float")) ** 2)
+                is_different = mse > threshold
         else:
-            mse = np.mean((gray_frame.astype("float") - last_frame_gray.astype("float")) ** 2)
-            is_different = mse > threshold
+            is_different = True
 
         if is_different:
             unique_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
