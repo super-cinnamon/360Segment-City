@@ -29,6 +29,16 @@ def load_pipeline(
 # Lazy pipeline to avoid consuming GPU at import time
 _depth_estimation_pipeline = None
 
+def unload_model():
+    global _depth_estimation_pipeline
+    _depth_estimation_pipeline = None
+    import torch
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 
 def _get_depth_pipeline():
     global _depth_estimation_pipeline

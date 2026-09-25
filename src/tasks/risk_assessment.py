@@ -177,6 +177,7 @@ class DetectedAgent:
         "side":       str,          # "front" | "left" | "right" | "back"
         "class_name": str,
         "class_id":   int,
+        "instance_id": int,         # instance id in the segmentation map
         "score":      float | None, # segmentation confidence
         "was_fused":  bool,
         "mask":       np.ndarray,   # binary boolean mask (H × W)
@@ -196,6 +197,7 @@ class DetectedAgent:
     seg_score:       float
     mode_depth:      float
     distance_weight: float
+    instance_id:     int
     mask:            Optional[np.ndarray] = field(default=None, repr=False)
     was_fused:       bool = False
 
@@ -232,12 +234,8 @@ def build_agents_from_segments(
         normalized_depth = (clamped - depth_min) / depth_range
         distance_weight  = round(1.0 - normalized_depth, 4)
 
-        agent_id = (
-            f"{seg.get('side', 'unk')}_"
-            f"frame{seg.get('frame', 0)}_"
-            f"{seg['class_name'].replace(' ', '_')}_"
-            f"{idx}"
-        )
+        inst_id = seg.get("instance_id", -1)
+        agent_id = f"{seg.get('side', 'unk')}_f{seg.get('frame', 0)}_id{inst_id}"
 
         agents.append(DetectedAgent(
             agent_id        = agent_id,
@@ -247,6 +245,7 @@ def build_agents_from_segments(
             seg_score       = float(seg.get("score") or 0.0),
             mode_depth      = raw_depth,
             distance_weight = distance_weight,
+            instance_id     = inst_id,
             mask            = seg.get("mask"),
             was_fused       = seg.get("was_fused", False),
         ))
@@ -327,7 +326,7 @@ def _build_epoch_scene_block(
             else:
                 trend = "STATIONARY / CONSTANT DISTANCE"
         else:
-            trend = "TRANSIENT DETECTION"
+            trend = "UNKNOWN FLOW"
         track_trends[agent_id] = trend
 
     multimodal_content = []
@@ -466,84 +465,96 @@ def _build_reason_prompt(scene_block: str) -> str:
         for i, (name, desc) in enumerate(EVALUATION_CRITERIA)
     )
 
-    return (
-        "SYSTEM ROLE:\n"
-        "You are an expert Defensive Driving AI for a two-wheeled vehicle (motorcycle/bicycle/e-bike). "
-        "Your goal is to analyze a 1-second 360-degree video snippet, cross-reference it with the provided "
-        "object list and distance metrics, and identify actionable dynamic hazards.\n\n"
-        "STRICT DO NOT USE / NEGATIVE CONSTRAINTS:\n"
-        "1. NEVER mention camera attributes, field of view, mounting position, or system capabilities "
-        "(e.g., DO NOT say 'The rider has a 360 view', 'The camera detects...', 'Because of the lens...').\n"
-        "2. NEVER use conversational filler, meta commentary, or chain-of-thought language such as 'Okay, let me think',\n"
-        "   'The user wants me to...', 'I see', 'as an AI', or any sentence that is not a hazard observation.\n"
-        "3. NEVER describe static environment features as hazards unless they actively restrict trajectory or visibility "
-        "(e.g., DO NOT say 'There is a parked car.' SAY 'The parked SUV obstructs visibility of emerging pedestrians from the right sidewalk').\n"
-        "4. NEVER state the obvious presence of moving objects without a hazard mechanism "
-        "(e.g., DO NOT say 'A car is driving next to me.' SAY 'The sedan on the left is matching speed in my blind spot, blocking lateral evasive maneuvers').\n"
-        "5. NEVER output a safe placeholder like 'No additional distinct hazard produced.' unless the scene is truly clear;\n"
-        "   if the scene is clear, return an empty hazards array [] inside the JSON object.\n"
-        "6. NEVER invent object IDs, distances, or lane geometry that are not supported by the scene data.\n"
-        "7. You MUST use the exact `object_id` provided in the [Detected Agents] or [Agent Trajectories] sections. Do not invent new IDs.\n"
-        "8. If the hazard relates to the overall environment (e.g., road surface, weather, traffic density), you MUST use `object_id: 'environment'`.\n\n"
-        "GROUNDING RULES FOR THE HAZARD:\n"
-        "- observation: one concrete, physically grounded sentence describing what is visible or moving. Use terms like\n"
-        "  'left-side sedan', 'wet metal seam', 'narrowing gap', 'approaching cyclist', or 'braking lead vehicle'.\n"
-        "  Mention specific high-risk details: if it is a child, if the agent is facing the road, or if turn signals are active.\n"
-        "  IMPORTANT: The ego-vehicle getting cut off is a very high risk situation, especially when the ego-rider intends to turn.\n"
-        "- danger_reasoning: explain the mechanism in 2-3 detailed clauses: how it threatens the rider, why it matters now "
-        "  (e.g., 'child may dart into road', 'facing road suggests imminent entry'), and what specific action is needed. "
-        "  Be explicit about vulnerability and unpredictable intent. Do not mention being an AI or discussing the prompt.\n"
-        "- actionable_risk: give imperative defensive-driving guidance such as 'Reduce speed and hold the left edge' or\n"
-        "  'Prepare a controlled swerve to the right'.\n"
-        "- You must produce EXACTLY ONE most-significant hazard. If no grounded threat exists, return an empty array [].\n\n"
-        "EVALUATION FRAMEWORK (Analyze hazards across these 7 categories):\n",
-        "1. Trajectory Conflict & Time-to-Collision (TTC):\n"
-        "   - Vehicles turning across the path (Dooring, left turns, sudden lane cuts).\n"
-        "   - Speed/distance differentials based on the provided object bounding boxes.\n"
-        "   - High-risk interactions: bikes and pedestrians in close proximity.\n"
-        "2. Vulnerability & Predictability:\n"
-        "   - Presence of children (extremely high risk due to unpredictability).\n"
-        "   - Road users facing the road (high risk of sudden entry).\n"
-        "   - Turn signals of other road users indicating intent to cross or merge.\n"
-        "3. Visibility Obscuration & Blind Spots:\n"
-        "   - Sightline blockages caused by large vehicles, pillars, or street furniture.\n"
-        "   - Areas where a hazard could emerge within < 1.5 seconds.\n"
-        "4. Surface & Traction Degradation:\n"
-        "   - Road surface hazards specifically dangerous to 2-wheelers (manhole covers, gravel, wet metal, track rails, sudden asphalt changes).\n"
-        "5. Ego-Vehicle Trajectory Constraints:\n"
-        "   - Escape routes: Is the rider boxed in on the left/right?\n"
-        "   - Following distance: Is the vehicle ahead braking or stopping abruptly?\n"
-        "6. Rider Awareness & Attention:\n"
-        "   - Is the rider likely aware of the hazard? Risk is significantly higher if a threat is closing in from a blind spot, an unexpected angle, or if the rider's current trajectory and speed show no defensive response to an approaching agent.\n"
-        "7. Signage, Signals & Lane Context:\n"
-        "   - Traffic Signals: Does a red light or stop sign create a high-risk zone for unexpected movements?\n"
-        "   - Lane Geometry: Does the rider's position (e.g., riding on the edge) or the lane type (merging, narrowing) elevate risk?\n"
-        "   - Markings: Are solid markings being violated or are there restrictive lane boundaries?\n\n",
-        "=== SCENE DATA (EPOCH BATCH) ===\n"
-        f"{scene_block}\n\n"
-        "=== EVALUATION CRITERIA ===\n"
-        f"{criteria_text}\n\n"
-        "=== OUTPUT FORMAT ===\n"
-        "Produce a single JSON object. The output must be valid JSON only. No markdown fences. No commentary. No filler text.\n"
-        "Use this structure exactly, containing only the single most important hazard in the hazards array:\n"
-        "{\n"
-        "  \"hazards\": [\n"
-        "    {\n"
-        "      \"object_id\": \"<ID_from_input_list_if_applicable>\",\n"
-        "      \"hazard_type\": \"<Collision Risk | Visibility Blocker | Surface Hazard | Trajectory Constraint>\",\n"
-        "      \"location_relative\": \"<e.g., 2 o'clock, 5 meters ahead>\",\n"
-        "      \"observation\": \"<Concrete scene-grounded description of the visible object or road state>\",\n"
-        "      \"danger_reasoning\": \"<Short mechanism: why the rider is exposed or can lose control within the next 1-2 seconds>\",\n"
-        "      \"actionable_risk\": \"<Defensive-driving instruction>\"\n"
-        "    }\n"
-        "  ]\n"
-        "}\n"
-        "Example of a valid hazard object:\n"
-        "{\"hazards\":[{\"object_id\":\"car_12\",\"hazard_type\":\"Collision Risk\",\"location_relative\":\"left rear quarter\",\"observation\":\"A sedan is cutting left while closing to the rider's lane edge.\",\"danger_reasoning\":\"The rider's left-side escape route is shrinking and the vehicle is encroaching into the shared path, leaving little time to brake or swerve.\",\"actionable_risk\":\"Reduce speed and keep a wider left buffer.\"}]}\n"
-        "Important: if the scene contains no physically grounded threat, return \"hazards\": [] as the array inside the JSON object. Do not fabricate a 'no hazard' narrative.\n"
-        "Return only JSON and no extra prose.\n\n"
-        "JSON Response:"
-    )
+    try:
+        with open("src/tasks/prompts/reason_generation.md", "r") as f:
+            template = f.read()
+        return template.format(
+            evaluation_criteria=EVALUATION_CRITERIA, # This is a list, but the template expects text?
+            # Wait, the original code used criteria_text for the template
+            criteria_text=criteria_text,
+            scene_block=scene_block
+        )
+    except Exception as e:
+        logger.error("Failed to load reason_generation.md: %s", e)
+        # Fallback to hardcoded if file is missing
+        return (
+            "SYSTEM ROLE:\n"
+            "You are an expert Defensive Driving AI for a two-wheeled vehicle (motorcycle/bicycle/e-bike). "
+            "Your goal is to analyze a 1-second 360-degree video snippet, cross-reference it with the provided "
+            "object list and distance metrics, and identify actionable dynamic hazards.\n\n"
+            "STRICT DO NOT USE / NEGATIVE CONSTRAINTS:\n"
+            "1. NEVER mention camera attributes, field of view, mounting position, or system capabilities "
+            "(e.g., DO NOT say 'The rider has a 360 view', 'The camera detects...', 'Because of the lens...').\n"
+            "2. NEVER use conversational filler, meta commentary, or chain-of-thought language such as 'Okay, let me think',\n"
+            "   'The user wants me to...', 'I see', 'as an AI', or any sentence that is not a hazard observation.\n"
+            "3. NEVER describe static environment features as hazards unless they actively restrict trajectory or visibility "
+            "(e.g., DO NOT say 'There is a parked car.' SAY 'The parked SUV obstructs visibility of emerging pedestrians from the right sidewalk').\n"
+            "4. NEVER state the obvious presence of moving objects without a hazard mechanism "
+            "(e.g., DO NOT say 'A car is driving next to me.' SAY 'The sedan on the left is matching speed in my blind spot, blocking lateral evasive maneuvers').\n"
+            "5. NEVER output a safe placeholder like 'No additional distinct hazard produced.' unless the scene is truly clear;\n"
+            "   if the scene is clear, return an empty hazards array [] inside the JSON object.\n"
+            "6. NEVER invent object IDs, distances, or lane geometry that are not supported by the scene data.\n"
+            "7. You MUST use the exact `object_id` provided in the [Detected Agents] or [Agent Trajectories] sections. Do not invent new IDs.\n"
+            "8. If the hazard relates to the overall environment (e.g., road surface, weather, traffic density), you MUST use `object_id: 'environment'`.\n\n"
+            "GROUNDING RULES FOR THE HAZARD:\n"
+            "- observation: one concrete, physically grounded sentence describing what is visible or moving. Use terms like\n"
+            "  'left-side sedan', 'wet metal seam', 'narrowing gap', 'approaching cyclist', or 'braking lead vehicle'.\n"
+            "  Mention specific high-risk details: if it is a child, if the agent is facing the road, or if turn signals are active.\n"
+            "  IMPORTANT: The ego-vehicle getting cut off is a very high risk situation, especially when the ego-rider intends to turn.\n"
+            "- danger_reasoning: explain the mechanism in 2-3 detailed clauses: how it threatens the rider, why it matters now "
+            "  (e.g., 'child may dart into road', 'facing road suggests imminent entry'), and what specific action is needed. "
+            "  Be explicit about vulnerability and unpredictable intent. Do not mention being an AI or discussing the prompt.\n"
+            "- actionable_risk: give imperative defensive-driving guidance such as 'Reduce speed and hold the left edge' or\n"
+            "  'Prepare a controlled swerve to the right'.\n"
+            "- You must produce EXACTLY ONE most-significant hazard. If no grounded threat exists, return an empty array [].\n\n"
+            "EVALUATION FRAMEWORK (Analyze hazards across these 7 categories):\n",
+            "1. Trajectory Conflict & Time-to-Collision (TTC):\n"
+            "   - Vehicles turning across the path (Dooring, left turns, sudden lane cuts).\n"
+            "   - Speed/distance differentials based on the provided object bounding boxes.\n"
+            "   - High-risk interactions: bikes and pedestrians in close proximity.\n"
+            "2. Vulnerability & Predictability:\n"
+            "   - Presence of children (extremely high risk due to unpredictability).\n"
+            "   - Road users facing the road (high risk of sudden entry).\n"
+            "   - Turn signals of other road users indicating intent to cross or merge.\n"
+            "3. Visibility Obscuration & Blind Spots:\n"
+            "   - Sightline blockages caused by large vehicles, pillars, or street furniture.\n"
+            "   - Areas where a hazard could emerge within < 1.5 seconds.\n"
+            "4. Surface & Traction Degradation:\n"
+            "   - Road surface hazards specifically dangerous to 2-wheelers (manhole covers, gravel, wet metal, track rails, sudden asphalt changes).\n"
+            "5. Ego-Vehicle Trajectory Constraints:\n"
+            "   - Escape routes: Is the rider boxed in on the left/right?\n"
+            "   - Following distance: Is the vehicle ahead braking or stopping abruptly?\n"
+            "6. Rider Awareness & Attention:\n"
+            "   - Is the rider likely aware of the hazard? Risk is significantly higher if a threat is closing in from a blind spot, an unexpected angle, or if the rider's current trajectory and speed show no defensive response to an approaching agent.\n"
+            "7. Signage, Signals & Lane Context:\n"
+            "   - Traffic Signals: Does a red light or stop sign create a high-risk zone for unexpected movements?\n"
+            "   - Lane Geometry: Does the rider's position (e.g., riding on the edge) or the lane type (merging, narrowing) elevate risk?\n"
+            "   - Markings: Are solid markings being violated or are there restrictive lane boundaries?\n\n",
+            "=== SCENE DATA (EPOCH BATCH) ===\n"
+            f"{scene_block}\n\n"
+            "=== EVALUATION CRITERIA ===\n"
+            f"{criteria_text}\n\n"
+            "=== OUTPUT FORMAT ===\n"
+            "Produce a single JSON object. The output must be valid JSON only. No markdown fences. No commentary. No filler text.\n"
+            "Use this structure exactly, containing only the single most important hazard in the hazards array:\n"
+            "{\n"
+            "  \"hazards\": [\n"
+            "    {\n"
+            "      \"object_id\": \"<ID_from_input_list_if_applicable>\",\n"
+            "      \"hazard_type\": \"<Collision Risk | Visibility Blocker | Surface Hazard | Trajectory Constraint>\",\n"
+            "      \"location_relative\": \"<e.g., 2 o'clock, 5 meters ahead>\",\n"
+            "      \"observation\": \"<Concrete scene-grounded description of the visible object or road state>\",\n"
+            "      \"danger_reasoning\": \"<Short mechanism: why the rider is exposed or can lose control within the next 1-2 seconds>\",\n"
+            "      \"actionable_risk\": \"<Defensive-driving instruction>\"\n"
+            "    }\n"
+            "  ]\n"
+            "}\n"
+            "Example of a valid hazard object:\n"
+            "{\"hazards\":[{\"object_id\":\"car_12\",\"hazard_type\":\"Collision Risk\",\"location_relative\":\"left rear quarter\",\"observation\":\"A sedan is cutting left while closing to the rider's lane edge.\",\"danger_reasoning\":\"The rider's left-side escape route is shrinking and the vehicle is encroaching into the shared path, leaving little time to brake or swerve.\",\"actionable_risk\":\"Reduce speed and keep a wider left buffer.\"}]}\n"
+            "Important: if the scene contains no physically grounded threat, return \"hazards\": [] as the array inside the JSON object. Do not fabricate a 'no hazard' narrative.\n"
+            "Return only JSON and no extra prose.\n\n"
+            "JSON Response:"
+        )
 
 
 def _build_reason_scoring_prompt(scene_block: str, reason: tuple[str, float], reason_index: int) -> str:
@@ -1270,9 +1281,12 @@ class RiskAssessmentEngine:
                                 dist[s] = max(0.0, p - delta)
                             note = f"reason {idx}: distribution weighted-normalized from JSON (sum > 1)"
                         elif total > 0:
+                            # Normalization: Ensure probabilities are strictly in [0, 1] and sum to 1.0.
+                            # If total < 1.0, we scale them up. If total > 1.0, we scale them down.
+                            scale = 1.0 / total
                             for s, p in extracted_probs.items():
-                                dist[s] = p
-                            note = f"reason {idx}: distribution from JSON"
+                                dist[s] = float(p * scale)
+                            note = f"reason {idx}: distribution linearly normalized from JSON (sum={total:.3f})"
                         else:
                             note = f"reason {idx}: JSON probabilities zero"
 

@@ -15,7 +15,13 @@ from src.tasks.depth_estimation import (
     predict_cubic_depths,
     mode_depth,
 )
+from src.tasks.flow_estimation import (
+    predict_flows,
+    mode_flow,
+    describe_flow,
+)
 from src.tasks.segmentation import predict_segmentations, predict_cubic_segmentations
+from src.tasks.id_tracker import ObjectIDTracker
 from src.tasks.environment import query_world_model
 from src.tasks.risk_assessment import (
     RiskAssessmentEngine,
@@ -72,6 +78,7 @@ class VideoProcessor:
     def __init__(self, video_loader: VideoLoader, cubic):
         self.video_loader = video_loader
         self.cubic = cubic
+        self.id_tracker = ObjectIDTracker() # Persist tracker across frames in epoch
         if cubic:
             # keep this for backward compatibility; code that provides explicit
             # frames will pass them into methods instead
@@ -117,6 +124,25 @@ class VideoProcessor:
             result = predict_cubic_depths(frames)
         else:
             result = predict_depths(frames)
+
+        if cache_path:
+            with open(cache_path, "wb") as f:
+                pickle.dump(result, f)
+
+        return result
+
+    def get_flow_masks_for(self, frames, epoch_idx=None, raw_start=None, raw_end=None):
+        # New API: compute flows for either cubic dict or list of frames
+        cache_path = self._get_cache_path("flow", epoch_idx, raw_start, raw_end)
+        if cache_path and cache_path.exists():
+            with open(cache_path, "rb") as f:
+                return pickle.load(f)
+
+        if self.cubic:
+            # Process each side
+            result = {side: predict_flows(face_frames) for side, face_frames in frames.items()}
+        else:
+            result = predict_flows(frames)
 
         if cache_path:
             with open(cache_path, "wb") as f:
@@ -227,6 +253,8 @@ class SegmentationPipeline:
         return items, static_items
 
     def prune_depth(self, segmented_items, depth_threshold=CONFIG["segmentation"]["depth_threshold"]):
+        min_depth_cfg = CONFIG["segmentation"].get("min_depth", {"sides": 0.1})
+
         for i, frame_segments in enumerate(segmented_items):
             if not frame_segments:
                 continue
@@ -234,10 +262,12 @@ class SegmentationPipeline:
             # Sort closest to furthest
             sorted_segments = sorted(frame_segments, key=lambda x: x["mode_depth"])
 
-            # Keep elements that fall within valid depth boundary [0.1, depth_threshold)
+            # Keep elements that fall within valid depth boundary [min_depth, depth_threshold)
+            # Use side-specific min_depth: 0.1 for back, 0.05 for sides
             segmented_items[i] = [
-                item for item in sorted_segments 
-                if item["mode_depth"] is not None and 0.1 <= item["mode_depth"] < depth_threshold
+                item for item in sorted_segments
+                if item["mode_depth"] is not None and
+                min_depth_cfg.get(item["side"], min_depth_cfg.get("sides", 0.1)) <= item["mode_depth"] < depth_threshold
             ]
 
         return segmented_items
@@ -250,6 +280,12 @@ class SegmentationPipeline:
         prepared_frames = self._prepare_frames_for_inference(self.video_loader.frames, image_scale=image_scale)
         depth_masks = self.video_processor.get_depth_mask_for(prepared_frames)
         segmentation_masks = self.video_processor.segment_for(prepared_frames, object_name)
+        flow_masks = self.video_processor.get_flow_masks_for(prepared_frames)
+
+        if not self.video_processor.cubic:
+            segmentation_masks = {"front": segmentation_masks}
+            depth_masks = {"front": depth_masks}
+            flow_masks = {"front": flow_masks}
         # create the list of segmented items with their class names and which frame they belong to
         segmented_items = []
         environment_items = []
@@ -260,26 +296,35 @@ class SegmentationPipeline:
                     # Retrieve human-readable class name from model's id2label mapping
                     class_name = CONFIG["segmentation"]["id2label"].get(str(segment_info["label_id"]), f"Class_{segment_info['label_id']}")
                     binary_mask = (segmentation_masks[key][i]["segmentation_map"] == segment_info["id"])
+
+                    # Keep IDs consistent across frames using Mask-Matching Cache
+                    consistent_id = self.video_processor.id_tracker.get_id(binary_mask, class_name, i)
+
                     # calculate the mode of the depth for this object
                     mode_depth_value = mode_depth(depth_masks[key][1][i], binary_mask) # ! this part needs to be switched to take more frames not just current
+                    # calculate the average flow for this object
+                    mode_flow_value = mode_flow(flow_masks[key][i], binary_mask)
                     frame_segments.append({
                         "frame": i,
                         "side": key,
                         "class_name": class_name,
                         "class_id": segment_info["label_id"],
+                        "instance_id": consistent_id,
                         "score": segment_info.get("score", None),
                         "was_fused": segment_info.get("was_fused", False),
                         "mask": binary_mask,
                         "mode_depth": mode_depth_value,
+                        "mode_flow": mode_flow_value,
+                        "flow_description": describe_flow(mode_flow_value, side=key),
                     })
             # prune segmentation items based on score and relevant labels
             frame_segments, environment_segments = self.prune_segmentation(frame_segments)
             segmented_items.append(frame_segments)
             environment_items.append(environment_segments)
         # prune segmentation items based on depth
-        segmented_items = self.prune_depth(segmented_items)         
+        segmented_items = self.prune_depth(segmented_items)
         environment_items = self.prune_depth(environment_items)
-      
+
         return segmented_items, environment_items
 
     # * is the same as the function i wrote above, but just takes specific frames as input, above function will be removed later
@@ -299,6 +344,9 @@ class SegmentationPipeline:
             segmentation_masks = self.video_processor.segment_for(
                 prepared_frames, object_name, epoch_idx=epoch_idx, raw_start=raw_start, raw_end=raw_end
             )
+            flow_masks = self.video_processor.get_flow_masks_for(
+                prepared_frames, epoch_idx=epoch_idx, raw_start=raw_start, raw_end=raw_end
+            )
             frames_front = prepared_frames["front"]
         else:
             depth_masks = self.video_processor.get_depth_mask_for(
@@ -307,7 +355,15 @@ class SegmentationPipeline:
             segmentation_masks = self.video_processor.segment_for(
                 prepared_frames, object_name, epoch_idx=epoch_idx, raw_start=raw_start, raw_end=raw_end
             )
+            flow_masks = self.video_processor.get_flow_masks_for(
+                prepared_frames, epoch_idx=epoch_idx, raw_start=raw_start, raw_end=raw_end
+            )
             frames_front = prepared_frames
+
+        if not self.video_processor.cubic:
+            segmentation_masks = {"front": segmentation_masks}
+            depth_masks = {"front": depth_masks}
+            flow_masks = {"front": flow_masks}
 
         # create the list of segmented items with their class names and which frame they belong to
         segmented_items = []
@@ -319,17 +375,26 @@ class SegmentationPipeline:
                     # Retrieve human-readable class name from model's id2label mapping
                     class_name = CONFIG["segmentation"]["id2label"].get(str(segment_info["label_id"]), f"Class_{segment_info['label_id']}")
                     binary_mask = (segmentation_masks[key][i]["segmentation_map"] == segment_info["id"])
+
+                    # Keep IDs consistent across frames using Mask-Matching Cache
+                    consistent_id = self.video_processor.id_tracker.get_id(binary_mask, class_name, i)
+
                     # calculate the mode of the depth for this object
                     mode_depth_value = mode_depth(depth_masks[key][1][i], binary_mask) # ! this part needs to be switched to take more frames not just current
+                    # calculate the average flow for this object
+                    mode_flow_value = mode_flow(flow_masks[key][i], binary_mask)
                     frame_segments.append({
                         "frame": i,
                         "side": key,
                         "class_name": class_name,
                         "class_id": segment_info["label_id"],
+                        "instance_id": consistent_id,
                         "score": segment_info.get("score", None),
                         "was_fused": segment_info.get("was_fused", False),
                         "mask": binary_mask,
                         "mode_depth": mode_depth_value,
+                        "mode_flow": mode_flow_value,
+                        "flow_description": describe_flow(mode_flow_value, side=key),
                     })
             # prune segmentation items based on score and relevant labels
             frame_segments, environment_segments = self.prune_segmentation(frame_segments)
@@ -498,6 +563,11 @@ class SegmentationPipeline:
 
     def cleanup_gpu(self):
         """Explicitly clear CUDA cache and perform garbage collection to prevent VRAM leaks."""
+        from src.tasks import depth_estimation, segmentation, flow_estimation
+        depth_estimation.unload_model()
+        segmentation.unload_model()
+        flow_estimation.unload_model()
+
         import torch
         import gc
         gc.collect()

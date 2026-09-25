@@ -1,9 +1,12 @@
 import json
 import os
+import logging
 from collections import Counter
 from typing import Optional, Sequence
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 # load config
@@ -29,7 +32,7 @@ def format_static_objects_summary(static_objects: Optional[Sequence[dict]]) -> s
 
 
 def render_environment_prompt(prompt: str, static_objects: Optional[Sequence[dict]] = None) -> str:
-    """Render the environment prompt without interpreting JSON-style braces in the template."""
+    """Render the environment prompt using .replace() to avoid conflicts with JSON curly braces."""
     if not prompt:
         return ""
 
