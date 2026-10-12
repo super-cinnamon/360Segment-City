@@ -165,7 +165,7 @@ def describe_flow(flow_vector, side="front"):
     magnitude = np.sqrt(u**2 + v**2)
 
     if magnitude < 0.5:
-        return "stationary"
+        return "matching speed and movement direction with ego-vehicle"
 
     # Get mapping for the specific camera side
     mapping = FLOW_MAPPINGS.get(side, FLOW_MAPPINGS.get("front"))

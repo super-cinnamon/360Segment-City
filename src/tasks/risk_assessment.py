@@ -42,7 +42,7 @@ from openai import OpenAI
 from dataclasses import dataclass, field
 from typing import Optional
 
-from src.tasks.config.utils import CONFIG
+from src.tasks.risk_map import RiskMapEngine, Hazard
 
 # Module logger
 logger = logging.getLogger(__name__)
@@ -55,6 +55,7 @@ _DEFAULT_API_BASE = _RA_CFG["api_base"]
 _DEFAULT_MODEL    = _RA_CFG["model_name"]
 _DEFAULT_N        = int(_RA_CFG.get("n_reasons", 5))
 _NORMALIZE_SCORES = _RA_CFG.get("normalize_scores", True)
+_SOFTMAX_TEMP     = float(_RA_CFG.get("softmax_temperature", 0.7))
 
 # ---------------------------------------------------------------------------
 # G-Eval Evaluation Criteria
@@ -235,7 +236,7 @@ def build_agents_from_segments(
         distance_weight  = round(1.0 - normalized_depth, 4)
 
         inst_id = seg.get("instance_id", -1)
-        agent_id = f"{seg.get('side', 'unk')}_f{seg.get('frame', 0)}_id{inst_id}"
+        agent_id = f"{seg.get('side', 'unk')}_id{inst_id}"
 
         agents.append(DetectedAgent(
             agent_id        = agent_id,
@@ -287,38 +288,62 @@ def _build_epoch_scene_block(
     epoch_agents:    list[list[DetectedAgent]],
     frames:          any,
     telemetry:       Optional[TelemetryData] = None,
+    agent_risks:     dict[str, float] = None,
 ) -> tuple[str, list[dict]]:
     """
-    Assembles a temporal scene context block across a sequence/batch of frames
-    (an "epoch" sliding window). Shows agent trajectory dynamics, depth trends,
-    and multi-camera coverage across the epoch.
+    Assembles a temporal scene context block across a sequence/batch of frames.
+    Instead of per-frame listings, it groups agents into trajectories (tracks)
+    to ensure continuity and prevent redundant entries for the same road user.
     """
     total_frames = len(epoch_agents)
 
-    # 1. Limit to 5 closest agents PER FRAME
-    selected_agents = []
+    # 1. Identify all unique agents across the entire epoch
+    all_unique_agents: dict[str, DetectedAgent] = {}
     for frame in epoch_agents:
-        # Sort agents in this specific frame by proximity
-        sorted_frame = sorted(frame, key=lambda a: a.mode_depth)
-        selected_agents.extend(sorted_frame[:5])
+        for a in frame:
+            if a.agent_id not in all_unique_agents:
+                all_unique_agents[a.agent_id] = a
 
-    all_agents_flat = selected_agents
-    sides_present = sorted(set(a.side for a in all_agents_flat))
+    # 2. Select the top 10 most critical unique agents
+    # We sort by the risk value provided (which is from the most recent frame)
+    if agent_risks:
+        sorted_ids = sorted(
+            all_unique_agents.keys(),
+            key=lambda aid: agent_risks.get(aid, 0.0),
+            reverse=True
+        )
+    else:
+        # Fallback: sort by the minimum depth seen across the epoch for that agent
+        # (Approximate proximity)
+        agent_min_depths = {}
+        for frame in epoch_agents:
+            for a in frame:
+                agent_min_depths[a.agent_id] = min(agent_min_depths.get(a.agent_id, float('inf')), a.mode_depth)
+        sorted_ids = sorted(agent_min_depths.keys(), key=lambda aid: agent_min_depths[aid])
 
-    # Group agents across the epoch by their unique ID to trace trajectory
-    tracks: dict[str, list[DetectedAgent]] = {}
-    for a in all_agents_flat:
-        key = a.agent_id
-        if key not in tracks:
-            tracks[key] = []
-        tracks[key].append(a)
+    top_agent_ids = sorted_ids[:10]
 
-    # Compute trends for all tracks
-    track_trends = {}
-    for agent_id, occurrences in tracks.items():
-        first = occurrences[0]
+    # 3. Build trajectories for these top agents
+    tracks: dict[str, list[DetectedAgent]] = {aid: [] for aid in top_agent_ids}
+    for frame in epoch_agents:
+        for a in frame:
+            if a.agent_id in tracks:
+                tracks[a.agent_id].append(a)
+
+    # 4. Compute trends and summarize for each track
+    track_summaries = []
+    multimodal_content = []
+
+    for aid in top_agent_ids:
+        occurrences = tracks[aid]
+        if not occurrences:
+            continue
+
+        first, last = occurrences[0], occurrences[-1]
+
+        # Depth trend
         if len(occurrences) > 1:
-            depth_delta = occurrences[-1].mode_depth - first.mode_depth
+            depth_delta = last.mode_depth - first.mode_depth
             if depth_delta < -0.05:
                 trend = "APPROACHING / CLOSING IN (HIGHER DANGER)"
             elif depth_delta > 0.05:
@@ -327,41 +352,28 @@ def _build_epoch_scene_block(
                 trend = "STATIONARY / CONSTANT DISTANCE"
         else:
             trend = "UNKNOWN FLOW"
-        track_trends[agent_id] = trend
 
-    multimodal_content = []
-    if selected_agents:
-        # Group the selected agents by frame and side for the prompt
-        groups = {}
-        for a in selected_agents:
-            key = (a.frame, a.side)
-            if key not in groups:
-                groups[key] = []
-            groups[key].append(a)
+        # Proximity summary
+        avg_prox = np.mean([a.distance_weight for a in occurrences]) * 100
+        frames_active = f"{occurrences[0].frame}-{occurrences[-1].frame}"
 
-        # Build the block
-        epoch_agent_lines = []
-        for (frame, side) in sorted(groups.keys()):
-            epoch_agent_lines.append(f"  Frame {frame} | Side {side}:")
-            for a in groups[(frame, side)]:
-                trend = track_trends.get(a.agent_id, "UNKNOWN")
-                epoch_agent_lines.append(
-                    f"    • [ID: {a.agent_id}] {a.class_name} | prox: {a.distance_weight * 100:.0f}% | trend: {trend}"
-                )
+        track_summaries.append(
+            f"    • [ID: {aid}] {first.class_name} | Side: {first.side} | "
+            f"Frames: {frames_active} | Avg Prox: {avg_prox:.0f}% | Trend: {trend}"
+        )
 
-        epoch_agents_block = "\n".join(epoch_agent_lines)
+        # Video for this track
+        try:
+            video_b64 = _generate_agent_bbox_video(aid, epoch_agents, frames)
+            if video_b64:
+                multimodal_content.append({"type": "video", "content": video_b64, "agent_id": aid})
+        except Exception:
+            pass
 
-        # Maintain multimodal list: one video per unique track among the selected agents
-        selected_agent_ids = {a.agent_id for a in selected_agents}
-        for agent_id in selected_agent_ids:
-            try:
-                video_b64 = _generate_agent_bbox_video(agent_id, epoch_agents, frames)
-                if video_b64:
-                    multimodal_content.append({"type": "video", "content": video_b64, "agent_id": agent_id})
-            except Exception:
-                pass
-    else:
-        epoch_agents_block = "  (no dynamic agents detected across epoch)"
+    # Build the final text block
+    epoch_agents_block = "\n".join(track_summaries) if track_summaries else "  (no dynamic agents detected across epoch)"
+
+    sides_present = sorted(set(a.side for a in [a for f in epoch_agents for a in f]))
 
     if telemetry is not None:
         telemetry_block = (
@@ -388,6 +400,7 @@ def _build_scene_block(
     agents:          list[DetectedAgent],
     frames:          any,
     telemetry:       Optional[TelemetryData],
+    agent_risks:     dict[str, float] = None,
 ) -> tuple[str, list[dict]]:
     """
     Assembles the shared scene-context block for single-frame evaluation.
@@ -395,11 +408,14 @@ def _build_scene_block(
     sides_present = sorted(set(a.side for a in agents))
     multimodal_content = []
     if agents:
-        # 1. Sort by proximity (closest first)
-        sorted_agents = sorted(agents, key=lambda a: a.mode_depth)
+        # 1. Sort by risk (descending) or proximity (closest first)
+        if agent_risks:
+            sorted_agents = sorted(agents, key=lambda a: agent_risks.get(a.agent_id, 0.0), reverse=True)
+        else:
+            sorted_agents = sorted(agents, key=lambda a: a.mode_depth)
 
-        # 2. Limit to 5 dynamic agents
-        top_agents = sorted_agents[:5]
+        # 2. Limit to 10 dynamic agents
+        top_agents = sorted_agents[:10]
 
         # 3. Group by frame and side
         groups = {}
@@ -986,6 +1002,79 @@ def _log_model_response(label: str, response) -> None:
         pass
 
 
+def generate_hazard_viz_video(
+    output_path: str,
+    frames: any,
+    epoch_agents: list[list[DetectedAgent]],
+    reasons_detail: list[dict],
+) -> str:
+    """
+    Generates a video visualization of the top 4 hazards identified in the risk assessment.
+    Each hazard is highlighted by its segmentation mask with a distinct color.
+    """
+    # 1. Identify the top 4 unique hazard IDs based on softmax weight
+    valid_reasons = [r for r in reasons_detail if r["hazards"]]
+    sorted_reasons = sorted(valid_reasons, key=lambda r: r["softmax_weight"], reverse=True)
+
+    top_hazard_ids = []
+    for r in sorted_reasons:
+        if not r["hazards"]: continue
+        oid = r["hazards"][0].get("object_id")
+        if oid and oid not in top_hazard_ids:
+            top_hazard_ids.append(oid)
+        if len(top_hazard_ids) >= 4:
+            break
+
+    COLORS = [
+        (0, 0, 255),   # Red
+        (0, 165, 255), # Orange
+        (0, 255, 255), # Yellow
+        (255, 0, 255), # Magenta
+    ]
+
+    out_dir = Path(output_path).parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if isinstance(frames, dict):
+        side = "front"
+        side_frames = frames[side]
+    else:
+        side_frames = frames
+
+    if not side_frames:
+        return ""
+
+    h, w, _ = side_frames[0].shape
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    video_path = Path(output_path)
+    out = cv2.VideoWriter(str(video_path), fourcc, 10.0, (w, h))
+
+    for f_idx in range(len(side_frames)):
+        img = side_frames[f_idx].copy()
+        frame_agents = epoch_agents[f_idx] if f_idx < len(epoch_agents) else []
+
+        for rank, oid in enumerate(top_hazard_ids):
+            color = COLORS[rank] if rank < len(COLORS) else (255, 255, 255)
+            agent = next((a for a in frame_agents if a.agent_id == oid), None)
+            if agent and agent.mask is not None and np.any(agent.mask):
+                mask = agent.mask
+                overlay = img.copy()
+                overlay[mask] = color
+                cv2.addWeighted(overlay, 0.5, img, 0.5, 0, img)
+                coords = np.argwhere(mask)
+                y0, x0 = coords.min(axis=0)
+                y1, x1 = coords.max(axis=0) + 1
+                cv2.rectangle(img, (x0, y0), (x1, y1), color, 2)
+                label = f"Hazard {rank+1}: {agent.class_name}"
+                cv2.putText(img, label, (x0, max(0, y0-10)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        out.write(img)
+    out.release()
+
+    with open(video_path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
+
+
 # ---------------------------------------------------------------------------
 # 4. Risk Assessment Engine
 # ---------------------------------------------------------------------------
@@ -995,7 +1084,7 @@ ENVIRONMENT_DISTANCE_WEIGHT = 0.5
 
 class RiskAssessmentEngine:
     """
-    Hybrid risk assessment engine for the 360° motorcycle safety pipeline.
+    Hybrid risk assessment engine for the 360-degree motorcycle safety pipeline.
 
     This engine combines the G-VEval mathematical framework with an intelligent
     synthesis judge.
@@ -1021,14 +1110,69 @@ class RiskAssessmentEngine:
         self.client     = OpenAI(base_url=api_base, api_key="vllm-local")
         self.model_name = model_name
         self.n_reasons  = n_reasons
+        self.risk_map_engine = RiskMapEngine()
 
-    def _get_distance_weight(self, object_id: str, agents: list[DetectedAgent]) -> float:
-        """Retrieves distance weight for an object; defaults to ENVIRONMENT_DISTANCE_WEIGHT."""
+    def _calculate_agent_risk_values(
+        self,
+        agents: list[DetectedAgent],
+        image: np.ndarray,
+        depth_map: np.ndarray,
+    ) -> tuple[dict[str, float], dict[str, Hazard]]:
+        """
+        Uses the RiskMapEngine to compute a risk score for each agent based on the spatial risk map.
+        Returns a mapping of agent_id -> mean_risk and agent_id -> matched_hazard.
+        """
+        # We use the agents' existing masks to generate a risk map that reflects the current scene
+        hazards_data = []
+        for a in agents:
+            hazards_data.append({
+                "id": a.agent_id,
+                "mask": a.mask,
+                "score": a.seg_score,
+                "conf": a.seg_score,
+                "description": f"{a.class_name} agent"
+            })
+
+        risk_map, computed_hazards = self.risk_map_engine.generate_risk_map(image, depth_map, hazards_data)
+
+        agent_risks = {}
+        agent_hazards = {}
+
+        for a in agents:
+            if a.mask is None or not np.any(a.mask):
+                agent_risks[a.agent_id] = 0.0
+                continue
+
+            # Calculate mean risk value within the agent's mask
+            risk_vals = risk_map[a.mask]
+            agent_risks[a.agent_id] = float(np.mean(risk_vals))
+
+            # Match to the computed Hazard object via ID (since we used agent_id in hazards_data)
+            for h in computed_hazards:
+                if h.id == a.agent_id:
+                    agent_hazards[a.agent_id] = h
+                    break
+
+        return agent_risks, agent_hazards
+
+    def _get_distance_weight(
+        self,
+        object_id: str,
+        agents: list[DetectedAgent],
+        agent_hazards: dict[str, Hazard] = None,
+    ) -> float:
+        """Retrieves distance weight for an object; uses semantic risk if a matched Hazard exists."""
         if not object_id or object_id == "unknown":
             return ENVIRONMENT_DISTANCE_WEIGHT
 
         if object_id == "environment":
             return ENVIRONMENT_DISTANCE_WEIGHT
+
+        # If we have a matched Hazard from RiskMapEngine, use its computed risk components.
+        if agent_hazards and object_id in agent_hazards:
+            hazard = agent_hazards[object_id]
+            weight = max(hazard.c_vlm, 0.2)
+            return max(0.0, min(1.0, weight))
 
         for a in agents:
             if a.agent_id == object_id:
@@ -1356,23 +1500,119 @@ class RiskAssessmentEngine:
     # Public API
     # ------------------------------------------------------------------
 
+    def _compute_final_risk_score(
+        self,
+        reasons:      list[tuple[str, float]],
+        score_dists:   list[dict[int, float]],
+        agents:        list[DetectedAgent],
+        score_scale:   list[int],
+        agent_hazards: dict[str, Hazard] = None,
+    ) -> tuple[float, dict[int, float], list[dict]]:
+        """
+        Fuses per-reason score distributions into a general risk score using
+        a severity-weighted softmax approach.
+        """
+        # 1. Basic Weights and Expectations
+        raw_weights = []
+        reason_expectations = []
+        reason_object_ids = []
+
+        for (text, p), dist in zip(reasons, score_dists):
+            # Extract object_id
+            oid = "unknown"
+            try:
+                parsed = json.loads(text)
+                hazards = parsed if isinstance(parsed, list) else parsed.get("hazards", [])
+                if hazards and isinstance(hazards[0], dict):
+                    oid = hazards[0].get("object_id", "unknown")
+            except Exception:
+                pass
+
+            # Environment fallback
+            if oid == "unknown" or oid not in [a.agent_id for a in agents]:
+                if any(k in text.lower() for k in ["road", "surface", "weather", "rain", "fog", "lighting"]):
+                    oid = "environment"
+            
+            reason_object_ids.append(oid)
+            
+            # w_i = P(r_i) * distance_weight
+            dist_w = self._get_distance_weight(oid, agents, agent_hazards=agent_hazards)
+            raw_weights.append(p * dist_w)
+            
+            # E_i = Σ (score * prob)
+            e_si = sum(s * prob for s, prob in dist.items())
+            reason_expectations.append(e_si)
+
+        # 2. Severity-Weighted Softmax
+        T = _SOFTMAX_TEMP
+        T = max(T, 1e-6)
+
+        if not reason_expectations:
+            return 1.0, {s: (1.0 if s == score_scale[0] else 0.0) for s in score_scale}, []
+
+        # Numerically stable softmax: subtract max(E/T)
+        e_over_t = np.array(reason_expectations) / T
+        max_val = np.max(e_over_t)
+        
+        # w_i' = (w_i * exp(E_i/T)) / Σ (w_j * exp(E_j/T))
+        exp_terms = np.exp(e_over_t - max_val)
+        weighted_exp = np.array(raw_weights) * exp_terms
+        sum_weighted_exp = np.sum(weighted_exp)
+
+        if sum_weighted_exp > 0:
+            softmax_weights = weighted_exp / sum_weighted_exp
+        else:
+            # Fallback to uniform if all are zero
+            softmax_weights = np.full(len(raw_weights), 1.0 / len(raw_weights))
+
+        # 3. Final Risk Score R = Σ (w_i' * E_i)
+        general_risk_score = np.sum(softmax_weights * np.array(reason_expectations))
+
+        # 4. Aggregate Distribution P(s) = Σ (w_i' * P(s|r_i))
+        aggregate_score_probs = {s: 0.0 for s in score_scale}
+        for sw, dist in zip(softmax_weights, score_dists):
+            for s, prob in dist.items():
+                aggregate_score_probs[s] += sw * prob
+
+        # 5. Enrich reasons detail
+        reasons_detail = []
+        for i, ((text, p), dist) in enumerate(zip(reasons, score_dists)):
+            hazards = []
+            try:
+                parsed = json.loads(text)
+                hazards = parsed if isinstance(parsed, list) else parsed.get("hazards", [])
+                if hazards and isinstance(hazards[0], dict):
+                    hazards[0]["object_id"] = reason_object_ids[i]
+            except Exception:
+                hazards = [{
+                    "object_id": reason_object_ids[i],
+                    "hazard_type": "Collision Risk",
+                    "location_relative": "unknown",
+                    "observation": text,
+                    "danger_reasoning": "N/A",
+                    "actionable_risk": "Maintain defensive speed.",
+                }]
+
+            reasons_detail.append({
+                "hazards": hazards,
+                "softmax_weight": round(float(softmax_weights[i]), 4),
+                "expected_score": round(reason_expectations[i], 3),
+                "score_probs": {sk: round(prob, 4) for sk, prob in dist.items()},
+            })
+
+        return float(general_risk_score), aggregate_score_probs, reasons_detail
+
     def assess_epoch(
         self,
         segmented_items: list[list[dict]],
         env_description: str,
         frames:          any = None,
+        depth_maps:      any = None,
         telemetry:       Optional[TelemetryData] = None,
         score_scale:     list[int] = [1, 2, 3, 4, 5],
     ) -> dict:
         """
         Processes all frames in segmented_items together to capture temporal dynamics.
-
-        Final Score Calculation (Distance-Aware G-VEval Fusion):
-        1. Reasons are sampled with confidence P(r_i).
-        2. Each reason is scored as a distribution D_i.
-        3. Weights are computed as W_raw,i = P(r_i) * distance_weight(object_id).
-        4. Weights are normalized: W_final,i = W_raw,i / Sum(W_raw).
-        5. Final Score = Sum(W_final,i * ExpectedScore(D_i)).
         """
         if not segmented_items:
             return {
@@ -1391,18 +1631,41 @@ class RiskAssessmentEngine:
         ]
         all_agents_flat = [a for frame in epoch_agents for a in frame]
 
-        scene_block, multimodal_content = _build_epoch_scene_block(env_description, epoch_agents, frames, telemetry)
+        # --- Risk Map Integration ---
+        agent_risks = {}
+        agent_hazards = {}
+        if frames and depth_maps:
+            # Use the last frame of the epoch as the reference for current risk
+            last_idx = len(segmented_items) - 1
 
-        # Limit multimodal content to avoid overloading the LLM (top 10 most critical)
-        # multimodal_content is a list of {"type": "video"|"image", "content": b64, "agent_id": id}
-        # We prioritize items with agent_ids that appear most frequently or are closest
+            # We handle both cubic (dict of lists) and non-cubic (list) formats
+            if isinstance(frames, dict):
+                for side in frames.keys():
+                    img = frames[side][last_idx]
+                    dmap = depth_maps[side][last_idx]
+                    # Get agents for this frame and side
+                    frame_agents = [a for a in epoch_agents[last_idx] if a.side == side]
+                    if frame_agents:
+                        risks, hazards = self._calculate_agent_risk_values(frame_agents, img, dmap)
+                        agent_risks.update(risks)
+                        agent_hazards.update(hazards)
+            else:
+                img = frames[last_idx]
+                dmap = depth_maps[last_idx]
+                frame_agents = epoch_agents[last_idx]
+                risks, hazards = self._calculate_agent_risk_values(frame_agents, img, dmap)
+                agent_risks.update(risks)
+                agent_hazards.update(hazards)
+
+        scene_block, multimodal_content = _build_epoch_scene_block(
+            env_description, epoch_agents, frames, telemetry, agent_risks=agent_risks
+        )
+
         if len(multimodal_content) > 10:
-            # Simple truncation to top 10 for now
             multimodal_content = multimodal_content[:10]
 
         reasons = self._generate_reasons_with_logprobs(scene_block, multimodal_content)
 
-        # If no reasons were generated, return a baseline minimal risk result
         if not reasons:
             sides_present = sorted(set(a.side for a in all_agents_flat))
             closest_agent = min(all_agents_flat, key=lambda a: a.mode_depth) if all_agents_flat else None
@@ -1426,80 +1689,23 @@ class RiskAssessmentEngine:
                 },
             }
 
-        # HYBRID FUSION: Get score distributions and critiques for each reason
         score_dists, critiques, fallback_note = self._score_synthesized(
             scene_block, reasons, score_scale, multimodal_content
         )
 
-        # --- Weight Calculation & Normalization ---
-        raw_weights = []
-        reason_object_ids = []
+        # New severity-weighted softmax fusion
+        general_risk_score, aggregate_score_probs, reasons_detail = self._compute_final_risk_score(
+            reasons, score_dists, all_agents_flat, score_scale, agent_hazards=agent_hazards
+        )
 
-        for (text, p), _ in zip(reasons, score_dists):
-            # Extract object_id from reason JSON
-            oid = "unknown"
-            try:
-                parsed = json.loads(text)
-                hazards = parsed if isinstance(parsed, list) else parsed.get("hazards", [])
-                if hazards and isinstance(hazards[0], dict):
-                    oid = hazards[0].get("object_id", "unknown")
-            except Exception:
-                pass
-
-            # Ensure environmental hazards are explicitly marked
-            if oid == "unknown" or oid not in [a.agent_id for a in all_agents_flat]:
-                # If the reason text mentions environment keywords, mark as environment
-                if any(k in text.lower() for k in ["road", "surface", "weather", "rain", "fog", "lighting"]):
-                    oid = "environment"
-
-            reason_object_ids.append(oid)
-            dist_w = self._get_distance_weight(oid, all_agents_flat)
-            raw_weights.append(p * dist_w)
-
-        sum_raw = sum(raw_weights) if raw_weights else 1.0
-        final_weights = [rw / sum_raw if sum_raw > 0 else 1.0/max(1, len(raw_weights)) for rw in raw_weights]
-
-        # --- Final Score & Aggregate Distribution ---
-        general_risk_score = 0.0
-        aggregate_score_probs = {s: 0.0 for s in score_scale}
-        reason_expectations = []
-
-        for w, dist in zip(final_weights, score_dists):
-            # Expected score for this reason: Sum(k * p_k)
-            e_si = sum(s * p for s, p in dist.items())
-            reason_expectations.append(e_si)
-            general_risk_score += w * e_si
-
-            # Aggregate distribution: P(score=k) = Sum(W_final,i * P(score=k | r_i))
-            for s, p in dist.items():
-                aggregate_score_probs[s] += w * p
-
-        # Enrich reasons detail
-        reasons_detail = []
-        for i, ((text, p), dist, crit) in enumerate(zip(reasons, score_dists, critiques)):
-            hazards = []
-            try:
-                parsed = json.loads(text)
-                hazards = parsed if isinstance(parsed, list) else parsed.get("hazards", [])
-                # Update object_id to "environment" if we determined it was environmental
-                if hazards and isinstance(hazards[0], dict):
-                    hazards[0]["object_id"] = reason_object_ids[i]
-            except Exception:
-                hazards = [{
-                    "object_id": reason_object_ids[i],
-                    "hazard_type": "Collision Risk",
-                    "location_relative": "unknown",
-                    "observation": text,
-                    "danger_reasoning": crit,
-                    "actionable_risk": "Maintain defensive speed and reassess the scene.",
-                }]
-
-            reasons_detail.append({
-                "hazards": hazards,
-                "weight": round(final_weights[i], 4),
-                "expected_score": round(reason_expectations[i], 3),
-                "score_probs": {sk: round(prob, 4) for sk, prob in dist.items()},
-            })
+        # Merge critiques back into reasons_detail
+        for i, crit in enumerate(critiques):
+            if i < len(reasons_detail):
+                # The hazards array might be empty or have one item
+                if reasons_detail[i]["hazards"]:
+                    reasons_detail[i]["hazards"][0]["danger_reasoning"] = crit
+                else:
+                    reasons_detail[i]["critique"] = crit
 
         fallback_notes = [fallback_note] if fallback_note else []
         sides_present = sorted(set(a.side for a in all_agents_flat))
@@ -1530,25 +1736,43 @@ class RiskAssessmentEngine:
         env_description: str,
         agents:          list[DetectedAgent],
         frames:          any = None,
+        depth_map:       any = None,
         telemetry:       Optional[TelemetryData] = None,
         score_scale:     list[int] = [1, 2, 3, 4, 5],
     ) -> dict:
         """
         Full G-VEval hybrid pipeline for a single frame or set of pre-built DetectedAgents.
-
-        Final Score Calculation (Distance-Aware G-VEval Fusion):
-        Final Score = Σ [W_final,i * ExpectedScore(D_i)]
-        where W_final,i is the normalized product of reason confidence and object distance.
         """
-        scene_block, multimodal_content = _build_scene_block(env_description, agents, frames, telemetry)
+        # --- Risk Map Integration ---
+        agent_risks = {}
+        agent_hazards = {}
+        if frames and depth_map:
+            # For a single frame, we can compute risk directly
+            # Handle cubic (dict) vs non-cubic (single image)
+            if isinstance(frames, dict):
+                # This is rare for a single frame evaluation but handled for consistency
+                for side in frames.keys():
+                    img = frames[side][0] if isinstance(frames[side], list) else frames[side]
+                    dmap = depth_map[side][0] if isinstance(depth_map[side], list) else depth_map[side]
+                    side_agents = [a for a in agents if a.side == side]
+                    if side_agents:
+                        risks, hazards = self._calculate_agent_risk_values(side_agents, img, dmap)
+                        agent_risks.update(risks)
+                        agent_hazards.update(hazards)
+            else:
+                risks, hazards = self._calculate_agent_risk_values(agents, frames, depth_map)
+                agent_risks.update(risks)
+                agent_hazards.update(hazards)
 
-        # Limit multimodal content to avoid overloading the LLM
+        scene_block, multimodal_content = _build_scene_block(
+            env_description, agents, frames, telemetry, agent_risks=agent_risks
+        )
+
         if len(multimodal_content) > 10:
             multimodal_content = multimodal_content[:10]
 
         reasons = self._generate_reasons_with_logprobs(scene_block, multimodal_content)
 
-        # If no reasons were generated, return a baseline minimal risk result
         if not reasons:
             sides_present = sorted(set(a.side for a in agents))
             closest_agent = min(agents, key=lambda a: a.mode_depth) if agents else None
@@ -1571,72 +1795,22 @@ class RiskAssessmentEngine:
                 },
             }
 
-        # HYBRID FUSION: Get score distributions and critiques for each reason
         score_dists, critiques, fallback_note = self._score_synthesized(
             scene_block, reasons, score_scale, multimodal_content
         )
 
-        # --- Weight Calculation & Normalization ---
-        raw_weights = []
-        reason_object_ids = []
+        # New severity-weighted softmax fusion
+        general_risk_score, aggregate_score_probs, reasons_detail = self._compute_final_risk_score(
+            reasons, score_dists, agents, score_scale, agent_hazards=agent_hazards
+        )
 
-        for (text, p), _ in zip(reasons, score_dists):
-            oid = "unknown"
-            try:
-                parsed = json.loads(text)
-                hazards = parsed if isinstance(parsed, list) else parsed.get("hazards", [])
-                if hazards and isinstance(hazards[0], dict):
-                    oid = hazards[0].get("object_id", "unknown")
-            except Exception:
-                pass
-
-            if oid == "unknown" or oid not in [a.agent_id for a in agents]:
-                if any(k in text.lower() for k in ["road", "surface", "weather", "rain", "fog", "lighting"]):
-                    oid = "environment"
-
-            reason_object_ids.append(oid)
-            dist_w = self._get_distance_weight(oid, agents)
-            raw_weights.append(p * dist_w)
-
-        sum_raw = sum(raw_weights) if raw_weights else 1.0
-        final_weights = [rw / sum_raw if sum_raw > 0 else 1.0/max(1, len(raw_weights)) for rw in raw_weights]
-
-        # --- Final Score & Aggregate Distribution ---
-        general_risk_score = 0.0
-        aggregate_score_probs = {s: 0.0 for s in score_scale}
-        reason_expectations = []
-
-        for w, dist in zip(final_weights, score_dists):
-            e_si = sum(s * p for s, p in dist.items())
-            reason_expectations.append(e_si)
-            general_risk_score += w * e_si
-            for s, p in dist.items():
-                aggregate_score_probs[s] += w * p
-
-        reasons_detail = []
-        for i, ((text, p), dist, crit) in enumerate(zip(reasons, score_dists, critiques)):
-            hazards = []
-            try:
-                parsed = json.loads(text)
-                hazards = parsed if isinstance(parsed, list) else parsed.get("hazards", [])
-                if hazards and isinstance(hazards[0], dict):
-                    hazards[0]["object_id"] = reason_object_ids[i]
-            except Exception:
-                hazards = [{
-                    "object_id": reason_object_ids[i],
-                    "hazard_type": "Collision Risk",
-                    "location_relative": "unknown",
-                    "observation": text,
-                    "danger_reasoning": crit,
-                    "actionable_risk": "Maintain defensive speed and reassess the scene.",
-                }]
-
-            reasons_detail.append({
-                "hazards": hazards,
-                "weight": round(final_weights[i], 4),
-                "expected_score": round(reason_expectations[i], 3),
-                "score_probs": {sk: round(prob, 4) for sk, prob in dist.items()},
-            })
+        # Merge critiques back into reasons_detail
+        for i, crit in enumerate(critiques):
+            if i < len(reasons_detail):
+                if reasons_detail[i]["hazards"]:
+                    reasons_detail[i]["hazards"][0]["danger_reasoning"] = crit
+                else:
+                    reasons_detail[i]["critique"] = crit
 
         fallback_notes = [fallback_note] if fallback_note else []
 

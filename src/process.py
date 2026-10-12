@@ -28,8 +28,10 @@ from src.tasks.risk_assessment import (
     TelemetryData,
     compute_depth_bounds,
 )
+from src.tasks.risk_map import RiskMapEngine
 from src.tasks.roi import (
     build_static_objects_summary,
+
     resize_frames,
     should_process_window,
 )
@@ -79,7 +81,10 @@ class VideoProcessor:
         self.video_loader = video_loader
         self.cubic = cubic
         self.id_tracker = ObjectIDTracker() # Persist tracker across frames in epoch
+        from src.tasks.panorama_tracker import PanoramaTracker
+        self.panorama_tracker = PanoramaTracker()
         if cubic:
+
             # keep this for backward compatibility; code that provides explicit
             # frames will pass them into methods instead
             self.cubic_frames = None
@@ -282,10 +287,17 @@ class SegmentationPipeline:
         segmentation_masks = self.video_processor.segment_for(prepared_frames, object_name)
         flow_masks = self.video_processor.get_flow_masks_for(prepared_frames)
 
+        # PANORAMA TRACKING: Use persistent tracker for continuity across frames and sides
+        tracks_per_frame = []
+        if not self.video_processor.cubic:
+            for frame in frames:
+                tracks_per_frame.append(self.video_processor.panorama_tracker.process_frame(frame))
+
         if not self.video_processor.cubic:
             segmentation_masks = {"front": segmentation_masks}
             depth_masks = {"front": depth_masks}
             flow_masks = {"front": flow_masks}
+
         # create the list of segmented items with their class names and which frame they belong to
         segmented_items = []
         environment_items = []
@@ -300,6 +312,22 @@ class SegmentationPipeline:
                     # Keep IDs consistent across frames using Mask-Matching Cache
                     consistent_id = self.video_processor.id_tracker.get_id(binary_mask, class_name, i)
 
+                    # PANORAMA TRACKING: Link segmentation mask to global track ID if available
+                    global_track_id = None
+                    if not self.video_processor.cubic and tracks_per_frame:
+                        # tracks_per_frame is a list of frames, each frame a list of track_data
+                        # Find if any global track in this frame overlaps with this mask's centroid
+                        coords = np.argwhere(binary_mask)
+                        if len(coords) > 0:
+                            cy, cx = np.mean(coords, axis=0)
+                            for track in tracks_per_frame[i]:
+                                tx1, ty1, tx2, ty2 = track['box']
+                                if tx1 <= cx <= tx2 and ty1 <= cy <= ty2:
+                                    global_track_id = track['id']
+                                    break
+
+                    final_id = global_track_id if global_track_id is not None else consistent_id
+
                     # calculate the mode of the depth for this object
                     mode_depth_value = mode_depth(depth_masks[key][1][i], binary_mask) # ! this part needs to be switched to take more frames not just current
                     # calculate the average flow for this object
@@ -309,7 +337,7 @@ class SegmentationPipeline:
                         "side": key,
                         "class_name": class_name,
                         "class_id": segment_info["label_id"],
-                        "instance_id": consistent_id,
+                        "instance_id": final_id,
                         "score": segment_info.get("score", None),
                         "was_fused": segment_info.get("was_fused", False),
                         "mask": binary_mask,
@@ -325,7 +353,7 @@ class SegmentationPipeline:
         segmented_items = self.prune_depth(segmented_items)
         environment_items = self.prune_depth(environment_items)
 
-        return segmented_items, environment_items
+        return segmented_items, environment_items, depth_masks
 
     # * is the same as the function i wrote above, but just takes specific frames as input, above function will be removed later
     def process_vision_for(self, frames, object_name=None, prepared_frames=None, image_scale: float | None = None, epoch_idx=None, raw_start=None, raw_end=None):
@@ -360,10 +388,17 @@ class SegmentationPipeline:
             )
             frames_front = prepared_frames
 
+        # PANORAMA TRACKING: Use persistent tracker for continuity across frames and sides
+        tracks_per_frame = []
+        if not self.video_processor.cubic:
+            for frame in frames:
+                tracks_per_frame.append(self.video_processor.panorama_tracker.process_frame(frame))
+
         if not self.video_processor.cubic:
             segmentation_masks = {"front": segmentation_masks}
             depth_masks = {"front": depth_masks}
             flow_masks = {"front": flow_masks}
+
 
         # create the list of segmented items with their class names and which frame they belong to
         segmented_items = []
@@ -379,6 +414,22 @@ class SegmentationPipeline:
                     # Keep IDs consistent across frames using Mask-Matching Cache
                     consistent_id = self.video_processor.id_tracker.get_id(binary_mask, class_name, i)
 
+                    # PANORAMA TRACKING: Link segmentation mask to global track ID if available
+                    global_track_id = None
+                    if not self.video_processor.cubic and tracks_per_frame:
+                        # tracks_per_frame is a list of frames, each frame a list of track_data
+                        # Find if any global track in this frame overlaps with this mask's centroid
+                        coords = np.argwhere(binary_mask)
+                        if len(coords) > 0:
+                            cy, cx = np.mean(coords, axis=0)
+                            for track in tracks_per_frame[i]:
+                                tx1, ty1, tx2, ty2 = track['box']
+                                if tx1 <= cx <= tx2 and ty1 <= cy <= ty2:
+                                    global_track_id = track['id']
+                                    break
+
+                    final_id = global_track_id if global_track_id is not None else consistent_id
+
                     # calculate the mode of the depth for this object
                     mode_depth_value = mode_depth(depth_masks[key][1][i], binary_mask) # ! this part needs to be switched to take more frames not just current
                     # calculate the average flow for this object
@@ -388,7 +439,7 @@ class SegmentationPipeline:
                         "side": key,
                         "class_name": class_name,
                         "class_id": segment_info["label_id"],
-                        "instance_id": consistent_id,
+                        "instance_id": final_id,
                         "score": segment_info.get("score", None),
                         "was_fused": segment_info.get("was_fused", False),
                         "mask": binary_mask,
@@ -404,7 +455,7 @@ class SegmentationPipeline:
         segmented_items = self.prune_depth(segmented_items)
         environment_items = self.prune_depth(environment_items)
 
-        return segmented_items, environment_items
+        return segmented_items, environment_items, depth_masks
 
     # * here is where the environment description is generated, the detected static elements will be added here next time
     def process_environment(self, static_objects=None, prompt: str = ENV_PROMPT) -> str:
@@ -487,7 +538,7 @@ class SegmentationPipeline:
                 "reason": "skip_low_roi",
             }
 
-        segmented_items, environment_items = self.process_vision_for(
+        segmented_items, environment_items, depth_masks = self.process_vision_for(
             frames,
             object_name=object_name,
             prepared_frames=prepared_frames,
@@ -506,6 +557,7 @@ class SegmentationPipeline:
             segmented_items,
             refined_environment_description,
             frames=prepared_frames,
+            depth_masks=depth_masks,
             telemetry=telemetry,
         )
 
@@ -524,6 +576,7 @@ class SegmentationPipeline:
             segmented_items: list[list[dict]],
             env_description: str,
             frames:          any = None,
+            depth_masks:     any = None,
             telemetry: Optional[TelemetryData] = None,
             api_base: str = CONFIG["risk_assessment"]["api_base"],
             model_name: str = CONFIG["risk_assessment"]["model_name"],
@@ -554,12 +607,34 @@ class SegmentationPipeline:
                 n_reasons=int(CONFIG["risk_assessment"].get("n_reasons", 5)),
             )
 
-            return engine.assess_epoch(
+            risk_result = engine.assess_epoch(
                 segmented_items=segmented_items,
                 env_description=env_description,
                 frames=frames,
+                depth_maps=depth_masks,
                 telemetry=telemetry,
             )
+
+            # Generate Hazard Visualization Video
+            try:
+                from src.tasks.risk_assessment import build_agents_from_segments, compute_depth_bounds, generate_hazard_viz_video
+                d_min, d_max = compute_depth_bounds(segmented_items)
+                epoch_agents = [
+                    build_agents_from_segments(f, d_min, d_max) for f in segmented_items
+                ]
+
+                viz_path = f"outputs/risk_viz/hazard_viz_{os.getpid()}.mp4"
+                generate_hazard_viz_video(
+                    output_path=viz_path,
+                    frames=frames,
+                    epoch_agents=epoch_agents,
+                    reasons_detail=risk_result.get("reasons", [])
+                )
+                risk_result["viz_video_path"] = viz_path
+            except Exception as e:
+                logger.warning("Failed to generate hazard visualization video: %s", e)
+
+            return risk_result
 
     def cleanup_gpu(self):
         """Explicitly clear CUDA cache and perform garbage collection to prevent VRAM leaks."""
