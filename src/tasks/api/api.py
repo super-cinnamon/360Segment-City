@@ -6,6 +6,14 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 
+def sanitize_float(val: float) -> float:
+    """Replace non-finite float values with finite approximations for JSON compliance."""
+    if math.isinf(val):
+        return -1e9 if val < 0 else 1e9
+    if math.isnan(val):
+        return 0.0
+    return val
+
 from src.tasks.config.utils import CONFIG
 from src.tasks.environment import load_world_model
 
@@ -88,13 +96,13 @@ async def create_chat_completion(request: ChatCompletionRequest):
             token_str = tokenizer.decode([idx.item()])
             top_logprobs_list.append({
                 "token": token_str,
-                "logprob": val.item()
+                "logprob": sanitize_float(val.item())
             })
             
         logprobs_payload = {
             "content": [{
                 "token": tokenizer.decode([gen_tokens[0].item()]),
-                "logprob": log_probs[gen_tokens[0].item()].item(),
+                "logprob": sanitize_float(log_probs[gen_tokens[0].item()].item()),
                 "top_logprobs": top_logprobs_list
             }]
         }

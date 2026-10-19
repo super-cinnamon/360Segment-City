@@ -113,7 +113,9 @@ def generate_cubic(frames, face_w=512):
     """Converts a list of 360/equirectangular frame images (NumPy arrays)
 
     into a dictionary containing 'left', 'right', 'front', and 'back' face lists.
+    Includes a slight overlap between faces to help reconnect split agent masks.
     """
+    overlap = CONFIG["processing"].get("side_overlap", 0.0)
     cubic_frames = {
         "left": [],
         "right": [],
@@ -122,18 +124,42 @@ def generate_cubic(frames, face_w=512):
     }
 
     for frame in frames:
-        # e2c returns a dictionary with keys: 'F', 'R', 'B', 'L', 'U', 'D'
-        cube_dict = py360convert.e2c(
-            frame, cube_format="dict", face_w=face_w, mode="bilinear"
-        )
+        if overlap == 0:
+            cube_dict = py360convert.e2c(
+                frame, cube_format="dict", face_w=face_w, mode="bilinear"
+            )
+            cubic_frames["front"].append(cube_dict["F"])
+            cubic_frames["right"].append(cube_dict["R"])
+            cubic_frames["back"].append(cube_dict["B"])
+            cubic_frames["left"].append(cube_dict["L"])
+        else:
+            h_pano, w_pano = frame.shape[:2]
+            def project_face(axis_id):
+                u = np.linspace(-1.0 - overlap, 1.0 + overlap, face_w)
+                v = np.linspace(1.0 + overlap, -1.0 - overlap, face_w)
+                uu, vv = np.meshgrid(u, v)
+                if axis_id == "front":
+                    theta = np.arctan2(uu, np.ones_like(uu))
+                    phi = np.arctan2(vv, np.sqrt(uu**2 + vv**2 + 1))
+                elif axis_id == "right":
+                    theta = np.arctan2(np.ones_like(uu), uu)
+                    phi = np.arctan2(vv, np.sqrt(uu**2 + vv**2 + 1))
+                elif axis_id == "back":
+                    theta = np.arctan2(-uu, -np.ones_like(uu))
+                    phi = np.arctan2(vv, np.sqrt(uu**2 + vv**2 + 1))
+                elif axis_id == "left":
+                    theta = np.arctan2(-np.ones_like(uu), -uu)
+                    phi = np.arctan2(vv, np.sqrt(uu**2 + vv**2 + 1))
+                lon = (theta / (2 * np.pi) + 0.5) * w_pano
+                lat = (np.pi/2 - phi) / np.pi * h_pano
+                return cv2.remap(frame, lon.astype(np.float32), lat.astype(np.float32),
+                                 interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP)
+            cubic_frames["front"].append(project_face("front"))
+            cubic_frames["right"].append(cv2.flip(project_face("right"), 1))
+            cubic_frames["back"].append(project_face("back"))
+            cubic_frames["left"].append(cv2.flip(project_face("left"), 1))
 
-        cubic_frames["front"].append(cube_dict["F"])
-        cubic_frames["right"].append(cube_dict["R"])
-        cubic_frames["back"].append(cube_dict["B"])
-        cubic_frames["left"].append(cube_dict["L"])
-    # erase original equirectangular frames from memory
     del frames
-
     return cubic_frames
 
 
@@ -155,24 +181,19 @@ def load_cubic(cubic_path_root, prefix="frame_", resizing_factor=0.5):
 
     range_folders = len([f for f in os.listdir(cubic_path_root) if os.path.isdir(os.path.join(cubic_path_root, f))])
 
-    # make it use tqdm
     for i in tqdm(range(range_folders), desc="Loading cubic frames"):
-        # :06d means: integer, padded with zeros to 6 digits
         folder_name = f"{prefix}{i:06d}"
 
         folder_path = Path(cubic_path_root + "/" + folder_name)
 
         if folder_path.exists():
-            # print(f"Found {folder_name}")
-            cubic_frames["back"].append(cv2.resize(cv2.flip(cv2.imread(f"{cubic_path_root}/{folder_name}/back.png"), 1), (0, 0), fx=resizing_factor, fy=resizing_factor))
-            cubic_frames["front"].append(cv2.resize(cv2.flip(cv2.imread(f"{cubic_path_root}/{folder_name}/front.png"), 1), (0, 0), fx=resizing_factor, fy=resizing_factor))
-
-            # left and right are flipped due to mirroring effect
+            cubic_frames["back"].append(cv2.resize(cv2.imread(f"{cubic_path_root}/{folder_name}/back.png"), (0, 0), fx=resizing_factor, fy=resizing_factor))
+            cubic_frames["front"].append(cv2.resize(cv2.imread(f"{cubic_path_root}/{folder_name}/front.png"), (0, 0), fx=resizing_factor, fy=resizing_factor))
             cubic_frames["right"].append(cv2.resize(cv2.flip(cv2.imread(f"{cubic_path_root}/{folder_name}/left.png"), 1), (0, 0), fx=resizing_factor, fy=resizing_factor))
             cubic_frames["left"].append(cv2.resize(cv2.flip(cv2.imread(f"{cubic_path_root}/{folder_name}/right.png"), 1), (0, 0), fx=resizing_factor, fy=resizing_factor))
         else:
             print(f"Skipping {folder_name} (does not exist)")
-    
+
     return cubic_frames
 
 

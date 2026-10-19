@@ -40,12 +40,17 @@ import os
 from pathlib import Path
 from openai import OpenAI
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Union
 
 from src.tasks.risk_map import RiskMapEngine, Hazard
+from src.tasks.config.utils import CONFIG
 
 # Module logger
 logger = logging.getLogger(__name__)
+
+# Debug directory for WM inputs
+DEBUG_WM_DIR = Path("outputs/debug_wm_inputs")
+DEBUG_WM_DIR.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------------------
 # Module-level config aliases
@@ -199,7 +204,8 @@ class DetectedAgent:
     mode_depth:      float
     distance_weight: float
     instance_id:     int
-    mask:            Optional[np.ndarray] = field(default=None, repr=False)
+    fused_sides:     list[str] = field(default_factory=list)
+    masks:           dict[str, np.ndarray] = field(default_factory=dict) # side -> mask
     was_fused:       bool = False
 
 # ---------------------------------------------------------------------------
@@ -229,26 +235,51 @@ def build_agents_from_segments(
     agents      = []
     depth_range = depth_max - depth_min if depth_max > depth_min else 1.0
 
-    for idx, seg in enumerate(frame_segments):
-        raw_depth        = float(seg.get("mode_depth", 0.5))
-        clamped          = max(depth_min, min(depth_max, raw_depth))
-        normalized_depth = (clamped - depth_min) / depth_range
-        distance_weight  = round(1.0 - normalized_depth, 4)
+    # Group segments by instance_id to merge across sides
+    instance_groups: dict[int, list[dict]] = {}
+    for seg_entry in frame_segments:
+        if isinstance(seg_entry, list):
+            segs_to_process = seg_entry
+        else:
+            segs_to_process = [seg_entry]
 
-        inst_id = seg.get("instance_id", -1)
-        agent_id = f"{seg.get('side', 'unk')}_id{inst_id}"
+        for seg in segs_to_process:
+            if not isinstance(seg, dict):
+                continue
+            iid = seg.get("instance_id", -1)
+            if iid not in instance_groups:
+                instance_groups[iid] = []
+            instance_groups[iid].append(seg)
+
+    agents = []
+    for iid, segs in instance_groups.items():
+        # Find the closest view for primary side and depth
+        best_seg = min(segs, key=lambda x: x.get("mode_depth", 0.5))
+
+        raw_depth = float(best_seg.get("mode_depth", 0.5))
+        clamped = max(depth_min, min(depth_max, raw_depth))
+        normalized_depth = (clamped - depth_min) / depth_range
+        distance_weight = round(1.0 - normalized_depth, 4)
+
+        # Collect all masks and sides
+        masks = {s.get("side", "unknown"): s.get("mask") for s in segs}
+        fused_sides = list(masks.keys())
+
+        # Create a stable ID based on instance_id
+        agent_id = f"agent_{iid}"
 
         agents.append(DetectedAgent(
             agent_id        = agent_id,
-            class_name      = seg["class_name"],
-            side            = seg.get("side", "unknown"),
-            frame           = seg.get("frame", 0),
-            seg_score       = float(seg.get("score") or 0.0),
+            class_name      = best_seg["class_name"],
+            side            = best_seg.get("side", "unknown"),
+            frame           = best_seg.get("frame", 0),
+            seg_score       = float(best_seg.get("score") or 0.0),
             mode_depth      = raw_depth,
             distance_weight = distance_weight,
-            instance_id     = inst_id,
-            mask            = seg.get("mask"),
-            was_fused       = seg.get("was_fused", False),
+            instance_id     = iid,
+            fused_sides     = fused_sides,
+            masks           = masks,
+            was_fused       = len(fused_sides) > 1,
         ))
 
     return agents
@@ -268,12 +299,15 @@ def compute_depth_bounds(segmented_items: list[list[dict]]) -> tuple[float, floa
     -------
     (depth_min, depth_max)
     """
-    all_depths = [
-        seg["mode_depth"]
-        for frame in segmented_items
-        for seg in frame
-        if seg.get("mode_depth") is not None
-    ]
+    all_depths = []
+    for frame in segmented_items:
+        for seg in frame:
+            if isinstance(seg, list):
+                for s in seg:
+                    if isinstance(s, dict) and s.get("mode_depth") is not None:
+                        all_depths.append(s["mode_depth"])
+            elif isinstance(seg, dict) and seg.get("mode_depth") is not None:
+                all_depths.append(seg["mode_depth"])
     if not all_depths:
         return 0.0, 1.0
     return float(min(all_depths)), float(max(all_depths))
@@ -289,6 +323,8 @@ def _build_epoch_scene_block(
     frames:          any,
     telemetry:       Optional[TelemetryData] = None,
     agent_risks:     dict[str, float] = None,
+    epoch_id:        str = "latest",
+    exclude_ids:     list[str] = None,
 ) -> tuple[str, list[dict]]:
     """
     Assembles a temporal scene context block across a sequence/batch of frames.
@@ -296,79 +332,113 @@ def _build_epoch_scene_block(
     to ensure continuity and prevent redundant entries for the same road user.
     """
     total_frames = len(epoch_agents)
+    exclude_ids = exclude_ids or []
 
-    # 1. Identify all unique agents across the entire epoch
-    all_unique_agents: dict[str, DetectedAgent] = {}
+    # 1. Identify all unique physical agents across the entire epoch (by instance_id)
+    all_physical_agents: dict[int, DetectedAgent] = {}
     for frame in epoch_agents:
         for a in frame:
-            if a.agent_id not in all_unique_agents:
-                all_unique_agents[a.agent_id] = a
+            # We store the first occurrence of the physical agent as the representative
+            if a.instance_id not in all_physical_agents:
+                all_physical_agents[a.instance_id] = a
 
-    # 2. Select the top 10 most critical unique agents
-    # We sort by the risk value provided (which is from the most recent frame)
+    # 2. Select the top 10 most critical unique physical agents
     if agent_risks:
-        sorted_ids = sorted(
-            all_unique_agents.keys(),
-            key=lambda aid: agent_risks.get(aid, 0.0),
+        # Aggregate risks by instance_id (max risk across sides for that physical agent)
+        instance_risks = {}
+        for frame in epoch_agents:
+            for a in frame:
+                risk = agent_risks.get(a.agent_id, 0.0)
+                instance_risks[a.instance_id] = max(instance_risks.get(a.instance_id, 0.0), risk)
+
+        sorted_instances = sorted(
+            [iid for iid, a in all_physical_agents.items() if a.agent_id not in exclude_ids],
+            key=lambda iid: instance_risks.get(iid, 0.0),
             reverse=True
         )
     else:
-        # Fallback: sort by the minimum depth seen across the epoch for that agent
-        # (Approximate proximity)
-        agent_min_depths = {}
+        # Fallback: sort by the minimum depth seen across the epoch for that physical agent
+        instance_min_depths = {}
         for frame in epoch_agents:
             for a in frame:
-                agent_min_depths[a.agent_id] = min(agent_min_depths.get(a.agent_id, float('inf')), a.mode_depth)
-        sorted_ids = sorted(agent_min_depths.keys(), key=lambda aid: agent_min_depths[aid])
+                instance_min_depths[a.instance_id] = min(instance_min_depths.get(a.instance_id, float('inf')), a.mode_depth)
+        sorted_instances = sorted(
+            [iid for iid, a in all_physical_agents.items() if a.agent_id not in exclude_ids],
+            key=lambda iid: instance_min_depths[iid]
+        )
 
-    top_agent_ids = sorted_ids[:10]
+    top_instance_ids = sorted_instances[:10]
 
-    # 3. Build trajectories for these top agents
-    tracks: dict[str, list[DetectedAgent]] = {aid: [] for aid in top_agent_ids}
+    # 3. Build trajectories for these top physical agents
+    tracks: dict[int, list[DetectedAgent]] = {iid: [] for iid in top_instance_ids}
     for frame in epoch_agents:
         for a in frame:
-            if a.agent_id in tracks:
-                tracks[a.agent_id].append(a)
+            if a.instance_id in tracks:
+                tracks[a.instance_id].append(a)
 
     # 4. Compute trends and summarize for each track
     track_summaries = []
     multimodal_content = []
 
-    for aid in top_agent_ids:
-        occurrences = tracks[aid]
+    for iid in top_instance_ids:
+        occurrences = tracks[iid]
         if not occurrences:
             continue
 
         first, last = occurrences[0], occurrences[-1]
 
-        # Depth trend
+        # Depth trend and proximity danger
+        min_depth = min(a.mode_depth for a in occurrences)
+        is_danger_zone = min_depth < 0.1
+
         if len(occurrences) > 1:
             depth_delta = last.mode_depth - first.mode_depth
             if depth_delta < -0.05:
                 trend = "APPROACHING / CLOSING IN (HIGHER DANGER)"
             elif depth_delta > 0.05:
                 trend = "RECEDING / MOVING AWAY"
+                if is_danger_zone:
+                    trend += " (HIGHER DANGER)"
             else:
                 trend = "STATIONARY / CONSTANT DISTANCE"
+                if is_danger_zone:
+                    trend += " (HIGHER DANGER)"
         else:
             trend = "UNKNOWN FLOW"
+            if is_danger_zone:
+                trend += " (HIGHER DANGER)"
 
         # Proximity summary
         avg_prox = np.mean([a.distance_weight for a in occurrences]) * 100
         frames_active = f"{occurrences[0].frame}-{occurrences[-1].frame}"
 
+        fused_info = ""
+        if first.was_fused and first.fused_sides:
+            fused_info = f" [fused: {', '.join(first.fused_sides)}]"
+
         track_summaries.append(
-            f"    • [ID: {aid}] {first.class_name} | Side: {first.side} | "
+            f"    • [ID: {first.agent_id}] {first.class_name}{fused_info} | Side: {first.side} | Min Depth: {min(a.mode_depth for a in occurrences):.3f} | "
             f"Frames: {frames_active} | Avg Prox: {avg_prox:.0f}% | Trend: {trend}"
         )
 
-        # Video for this track
-        try:
-            video_b64 = _generate_agent_bbox_video(aid, epoch_agents, frames)
-            if video_b64:
-                multimodal_content.append({"type": "video", "content": video_b64, "agent_id": aid})
-        except Exception:
-            pass
+    # --- Multimodal Content ---
+    # Default: Try to generate one composite video for the whole epoch
+    try:
+        composite_video_b64 = _generate_epoch_composite_video(top_instance_ids, epoch_agents, frames)
+        if composite_video_b64:
+            multimodal_content.append({"type": "video", "content": composite_video_b64, "description": "Composite epoch view"})
+    except Exception as e:
+        logger.warning("Failed to generate composite video, falling back to per-agent videos: %s", e)
+        # Fallback: generate individual videos for each top physical agent
+        for iid in top_instance_ids:
+            # We use the representative's agent_id for the per-agent video
+            rep = all_physical_agents[iid]
+            try:
+                video_b64 = _generate_agent_bbox_video(rep.agent_id, epoch_agents, frames)
+                if video_b64:
+                    multimodal_content.append({"type": "video", "content": video_b64, "agent_id": rep.agent_id})
+            except Exception:
+                pass
 
     # Build the final text block
     epoch_agents_block = "\n".join(track_summaries) if track_summaries else "  (no dynamic agents detected across epoch)"
@@ -392,6 +462,28 @@ def _build_epoch_scene_block(
         f"{epoch_agents_block}\n\n"
         f"[Physical Telemetry]\n{telemetry_block}"
     )
+
+    # Debug: save the exact input prompt and multimodal summary sent to WM
+    try:
+        prompt_debug_path = DEBUG_WM_DIR / f"wm_prompt_{epoch_id}.md"
+        with open(prompt_debug_path, "w", encoding="utf-8") as f:
+            f.write(f"# World Model Input Prompt\n\n## Text Prompt\n\n{text}\n\n## Multimodal Content\n")
+            for i, item in enumerate(multimodal_content):
+                if item["type"] == "video":
+                    f.write(f"- Video {i}: {item.get('description', 'No description')} (ID: {item.get('agent_id', 'N/A')})\n")
+                    # Save a copy of the video to the debug directory
+                    video_filename = f"composite_{epoch_id}_{i}.mp4"
+                    with open(DEBUG_WM_DIR / video_filename, "wb") as vf:
+                        vf.write(base64.b64decode(item["content"]))
+                elif item["type"] == "image":
+                    f.write(f"- Image {i}: (ID: {item.get('agent_id', 'N/A')})\n")
+                    # Save a copy of the image to the debug directory
+                    image_filename = f"crop_{epoch_id}_{i}.jpg"
+                    with open(DEBUG_WM_DIR / image_filename, "wb") as ifile:
+                        ifile.write(base64.b64decode(item["content"]))
+    except Exception as e:
+        logger.warning("Failed to save debug prompt: %s", e)
+
     return text, multimodal_content
 
 
@@ -401,18 +493,22 @@ def _build_scene_block(
     frames:          any,
     telemetry:       Optional[TelemetryData],
     agent_risks:     dict[str, float] = None,
+    exclude_ids:     list[str] = None,
 ) -> tuple[str, list[dict]]:
     """
     Assembles the shared scene-context block for single-frame evaluation.
     """
     sides_present = sorted(set(a.side for a in agents))
     multimodal_content = []
+    exclude_ids = exclude_ids or []
     if agents:
-        # 1. Sort by risk (descending) or proximity (closest first)
+        # 1. Filter excluded agents and then sort by risk (descending) or proximity (closest first)
+        filtered_agents = [a for a in agents if a.agent_id not in exclude_ids]
         if agent_risks:
-            sorted_agents = sorted(agents, key=lambda a: agent_risks.get(a.agent_id, 0.0), reverse=True)
+            sorted_agents = sorted(filtered_agents, key=lambda a: agent_risks.get(a.agent_id, 0.0), reverse=True)
         else:
-            sorted_agents = sorted(agents, key=lambda a: a.mode_depth)
+            sorted_agents = sorted(filtered_agents, key=lambda a: a.mode_depth)
+
 
         # 2. Limit to 10 dynamic agents
         top_agents = sorted_agents[:10]
@@ -430,18 +526,22 @@ def _build_scene_block(
         for (frame, side) in sorted(groups.keys()):
             agent_lines.append(f"  Frame {frame} | Side {side}:")
             for a in groups[(frame, side)]:
-                fused_tag = " [fused]" if a.was_fused else ""
+                fused_info = ""
+                if a.was_fused:
+                    sides_str = ", ".join(a.fused_sides) if a.fused_sides else "multiple"
+                    fused_info = f" [fused: {sides_str}]"
+
                 agent_lines.append(
-                    f"    • [ID: {a.agent_id}] {a.class_name}{fused_tag} "
-                    f"| depth: {a.mode_depth:.3f} | prox: {a.distance_weight * 100:.0f}% "
-                    f"| conf: {a.seg_score * 100:.0f}%"
+                    f"    • [ID: {a.agent_id}] {a.class_name}{fused_info} "
+                    f"| Depth: {a.mode_depth:.3f} (Prox: {a.distance_weight * 100:.0f}%) "
+                    f"| Conf: {a.seg_score * 100:.0f}%"
                 )
                 # Extract image for this agent
                 try:
                     f_idx = a.frame
                     s = a.side
-                    mask = a.mask
-                    if frames:
+                    mask = a.masks.get(s)
+                    if frames and mask is not None:
                         frame_img = frames[s][f_idx] if isinstance(frames, dict) else frames[f_idx]
                         img_b64 = _generate_agent_bbox_image(a.agent_id, frame_img, mask)
                         if img_b64:
@@ -471,7 +571,7 @@ def _build_scene_block(
     return text, multimodal_content
 
 
-def _build_reason_prompt(scene_block: str) -> str:
+def _build_reason_prompt(scene_block: str, already_extracted_hazards: list[str] = None) -> str:
     """
     Step 1 prompt — asks the model to produce a concise, actionable dynamic hazard
     in a defensive-driving JSON format.
@@ -481,12 +581,17 @@ def _build_reason_prompt(scene_block: str) -> str:
         for i, (name, desc) in enumerate(EVALUATION_CRITERIA)
     )
 
+    # Format already extracted hazards as a simple list
+    hazards_text = "None"
+    if already_extracted_hazards:
+        hazards_text = "\n".join([f" - {hid}" for hid in already_extracted_hazards])
+
     try:
         with open("src/tasks/prompts/reason_generation.md", "r") as f:
             template = f.read()
         return template.format(
             evaluation_criteria=EVALUATION_CRITERIA, # This is a list, but the template expects text?
-            # Wait, the original code used criteria_text for the template
+            already_extracted_hazards=hazards_text,
             criteria_text=criteria_text,
             scene_block=scene_block
         )
@@ -512,6 +617,9 @@ def _build_reason_prompt(scene_block: str) -> str:
             "6. NEVER invent object IDs, distances, or lane geometry that are not supported by the scene data.\n"
             "7. You MUST use the exact `object_id` provided in the [Detected Agents] or [Agent Trajectories] sections. Do not invent new IDs.\n"
             "8. If the hazard relates to the overall environment (e.g., road surface, weather, traffic density), you MUST use `object_id: 'environment'`.\n\n"
+            "=== ALREADY EXTRACTED HAZARDS ===\n"
+            f"{hazards_text}\n"
+            "If this section is not empty, DO NOT produce a hazard for any of the object_ids listed here. Look for DIFFERENT hazards or agents.\n\n"
             "GROUNDING RULES FOR THE HAZARD:\n"
             "- observation: one concrete, physically grounded sentence describing what is visible or moving. Use terms like\n"
             "  'left-side sedan', 'wet metal seam', 'narrowing gap', 'approaching cyclist', or 'braking lead vehicle'.\n"
@@ -523,7 +631,7 @@ def _build_reason_prompt(scene_block: str) -> str:
             "- actionable_risk: give imperative defensive-driving guidance such as 'Reduce speed and hold the left edge' or\n"
             "  'Prepare a controlled swerve to the right'.\n"
             "- You must produce EXACTLY ONE most-significant hazard. If no grounded threat exists, return an empty array [].\n\n"
-            "EVALUATION FRAMEWORK (Analyze hazards across these 7 categories):\n",
+            "EVALUATION FRAMEWORK (Analyze hazards across these 7 categories):\n"
             "1. Trajectory Conflict & Time-to-Collision (TTC):\n"
             "   - Vehicles turning across the path (Dooring, left turns, sudden lane cuts).\n"
             "   - Speed/distance differentials based on the provided object bounding boxes.\n"
@@ -607,12 +715,13 @@ def _build_reason_scoring_prompt(scene_block: str, reason: tuple[str, float], re
         "5. Amplify High-Risk Maneuvers: Scenarios where the ego-vehicle is being cut off, especially when the "
         "   ego-rider intends to turn, should be treated as very high risk and push the score toward 4 or 5.\n"
         "6. Amplify Awareness & Signal Risk: Scenarios where a hazard is closing in while the rider appears unaware (e.g., from a blind spot), or where critical traffic signals (red lights/stop signs) or lane markings are being ignored, should strongly push the score toward 4 or 5.\n"
-        "7. Mapping Logic: A 'Severe Hazard' or 'Imminent Collision' is a Score 5. A 'Clear Road' or 'No Hazard' is a Score 1. Do not invert this logic.\n\n"
+        "7. Prioritize Blind-Spot Risks: Hazards involving agents behind the ego-vehicle (Side: back), especially those partially obstructed, should be treated with extreme caution and strongly push the score toward 4 or 5, as they represent a critical lack of visibility for the rider.\n"
+        "8. Mapping Logic: A 'Severe Hazard' or 'Imminent Collision' is a Score 5. A 'Clear Road' or 'No Hazard' is a Score 1. Do not invert this logic.\n\n"
         "PROBABILITY DISTRIBUTION RULES:\n"
         "1. The values in `score_probs` must sum exactly to 1.0.\n"
         "2. Expected Value Calculation: The final risk score is computed as a weighted average. For this reason, the model will calculate an 'expected score' = Σ (score * probability). For example, a distribution of {'4': 0.8, '5': 0.2} results in an expected score of 4.2.\n"
         "3. Concentration: If the evidence strongly supports a specific score, assign the vast majority of the probability (e.g., 0.8 to 1.0) to that specific score to create a strong, clear signal.\n"
-        "4. Avoid 'Flat' Distributions: Do not assign minimal equal probabilities (e.g., 0.2 across all) unless you are genuinely uncertain. A flat distribution always results in an expected score of 3.0, which dilutes the risk signal and may mask severe hazards or overstate minimal risks.\n\n",
+        "4. Avoid 'Flat' Distributions: Do not assign minimal equal probabilities (e.g., 0.2 across all) unless you are genuinely uncertain. A flat distribution always results in an expected score of 3.0, which dilutes the risk signal and may mask severe hazards or overstate minimal risks.\n\n"
         "RESPONSE FORMAT:\n"
         "Produce exactly one JSON object. Do not emit any other text, score digits, or commentary outside the JSON.\n"
         "The JSON must follow this schema:\n"
@@ -638,6 +747,58 @@ def _build_reason_scoring_prompt(scene_block: str, reason: tuple[str, float], re
 
 VIDEO_CACHE_DIR = Path("outputs/risk_videos")
 
+def get_color_for_agent(agent_id: str) -> tuple[int, int, int]:
+    """
+    Returns a stable BGR color based on the agent_id.
+    """
+    import zlib
+    palette = [
+        (0, 255, 0),   # Green
+        (0, 0, 255),   # Red
+        (255, 0, 0),   # Blue
+        (0, 255, 255), # Yellow
+        (255, 0, 255), # Magenta
+        (255, 255, 0), # Cyan
+        (0, 165, 255), # Orange
+        (128, 0, 128), # Purple
+        (255, 165, 0), # Blue-Orange
+        (0, 128, 128), # Teal
+    ]
+    idx = zlib.adler32(agent_id.encode()) % len(palette)
+    return palette[idx]
+
+
+def _correct_object_id(returned_id: str, valid_ids: list[str], id_to_class: dict[str, str] = None) -> str:
+    """
+    Ensures the returned object_id is grounded in the provided valid_ids.
+    If not exactly matching or 'environment', it tries to find the closest match
+    based on numeric IDs or class keywords.
+    """
+    if not returned_id or returned_id == "environment":
+        return returned_id
+
+    if returned_id in valid_ids:
+        return returned_id
+
+    # 1. Attempt to find a match based on numeric ID
+    import re
+    nums = re.findall(r'\d+', returned_id)
+    if nums:
+        primary_num = nums[0]
+        for vid in valid_ids:
+            if primary_num in vid:
+                return vid
+
+    # 2. Attempt to find a match based on class keywords (if mapping provided)
+    if id_to_class:
+        returned_id_low = returned_id.lower()
+        for vid, class_name in id_to_class.items():
+            if class_name.lower() in returned_id_low:
+                return vid
+
+    # Fallback: return "unknown" if no match found
+    return "unknown"
+
 def _generate_agent_bbox_image(
     agent_id: str,
     frame: np.ndarray,
@@ -656,12 +817,156 @@ def _generate_agent_bbox_image(
     y0, x0 = coords.min(axis=0)
     y1, x1 = coords.max(axis=0) + 1
 
-    cv2.rectangle(img, (x0, y0), (x1, y1), (0, 255, 0), 2)
-    cv2.putText(img, agent_id, (x0, max(0, y0-10)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+    color = get_color_for_agent(agent_id)
+    cv2.rectangle(img, (x0, y0), (x1, y1), color, 3)
+
+    # Label with background
+    text = agent_id
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.5
+    thickness = 1
+    (tw, th), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+    text_x, text_y = x0, max(0, y0 - 10)
+    cv2.rectangle(img, (text_x, text_y - th - baseline), (text_x + tw, text_y + baseline), color, -1)
+    cv2.putText(img, text, (text_x, text_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
     _, buffer = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
     return base64.b64encode(buffer).decode("utf-8")
+
+def _generate_epoch_composite_video(
+    top_instance_ids: list[int],
+    epoch_agents: list[list[DetectedAgent]],
+    frames: any
+) -> str:
+    """
+    Generates a single composite video for an epoch, stitching all camera sides
+    horizontally and drawing bounding boxes for the top physical agents.
+    Caches the video and returns the base64 encoded video string.
+    """
+    VIDEO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    # Create a stable cache name based on top physical agent IDs
+    cache_key = "_".join(map(str, sorted(top_instance_ids)))
+    if len(cache_key) > 100: cache_key = cache_key[:100]
+    video_path = VIDEO_CACHE_DIR / f"composite_{cache_key}.mp4"
+
+    if video_path.exists():
+        with open(video_path, "rb") as f:
+            return base64.b64encode(f.read()).decode("utf-8")
+
+    # Define the desired order of sides for the composite strip
+    target_sides = ['left', 'front', 'right', 'back']
+    # Only use sides that are actually present in the frames data
+    available_sides = []
+    if isinstance(frames, dict):
+        available_sides = [s for s in target_sides if s in frames]
+    elif isinstance(frames, list):
+        available_sides = ['front'] # Assume list is front if not specified
+
+    if not available_sides:
+        return ""
+
+    video_frames = []
+    # Iterate through the epoch frames
+    num_frames = len(epoch_agents)
+    for f_idx in range(num_frames):
+        # 1. Build the composite frame by stitching available sides
+        side_imgs = []
+        for side in available_sides:
+            img = frames[side][f_idx] if isinstance(frames, dict) else frames[f_idx]
+            side_imgs.append(img)
+
+        composite_img = np.hstack(side_imgs)
+
+        # Calculate side widths for BBox offsets
+        side_widths = []
+        current_offset = 0
+        for side in available_sides:
+            img = frames[side][f_idx] if isinstance(frames, dict) else frames[f_idx]
+            w = img.shape[1]
+            side_widths.append((side, current_offset))
+            current_offset += w
+
+        side_offset_map = dict(side_widths)
+
+        # 2. Draw BBoxes for all top agents present in this frame
+        placed_labels = []  # Track (x, y, w, h) of labels in this frame
+        for agent in epoch_agents[f_idx]:
+            if agent.instance_id in top_instance_ids:
+                # Find the offset for this agent's side
+                for side in agent.fused_sides:
+                    if side in side_offset_map:
+                        offset_x = side_offset_map[side]
+                        mask = agent.masks.get(side)
+                        if mask is not None and np.any(mask):
+                            coords = np.argwhere(mask)
+                            y0, x0 = coords.min(axis=0)
+                            y1, x1 = coords.max(axis=0) + 1
+
+                            # Adjust X coordinates by the side offset
+                            abs_x0 = x0 + offset_x
+                            abs_x1 = x1 + offset_x
+
+                            # Draw BBox
+                            color = get_color_for_agent(agent.agent_id)
+                            cv2.rectangle(composite_img, (abs_x0, y0), (abs_x1, y1), color, 3)
+
+                            # Label with background and overlap avoidance
+                            text = f"ID:{agent.agent_id}"
+                            font = cv2.FONT_HERSHEY_SIMPLEX
+                            font_scale = 0.5
+                            thickness = 1
+                            (tw, th), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+
+                            # Initial position
+                            label_x = abs_x0
+                            label_y = max(0, y0 - 10)
+
+                            # Simple overlap avoidance: shift label up if it overlaps an existing one
+                            # (only checking a few shifts for simplicity)
+                            for shift in range(0, 100, 20):
+                                label_rect = (label_x, label_y - th - baseline - shift, label_x + tw, label_y + baseline - shift)
+                                overlap = False
+                                for prev_rect in placed_labels:
+                                    # Check intersection of rectangles
+                                    if not (label_rect[2] <= prev_rect[0] or label_rect[0] >= prev_rect[2] or
+                                            label_rect[3] <= prev_rect[1] or label_rect[1] >= prev_rect[3]):
+                                        overlap = True
+                                        break
+                                if not overlap:
+                                    break
+                                label_y -= 20 # shift further up
+
+                            # Draw label background and text
+                            cv2.rectangle(composite_img, (label_x, label_y - th - baseline), (label_x + tw, label_y + baseline), color, -1)
+                            cv2.putText(composite_img, text, (label_x, label_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+                            # Store the final label position
+                            placed_labels.append((label_x, label_y - th - baseline, label_x + tw, label_y + baseline))
+
+                        # Draw label background and text
+                        cv2.rectangle(composite_img, (label_x, label_y - th - baseline), (label_x + tw, label_y + baseline), color, -1)
+                        cv2.putText(composite_img, text, (label_x, label_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+                        # Store the final label position
+                        placed_labels.append((label_x, label_y - th - baseline, label_x + tw, label_y + baseline))
+
+        video_frames.append(composite_img)
+
+    if not video_frames:
+        return ""
+
+    # Save as video
+    h, w, _ = video_frames[0].shape
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(str(video_path), fourcc, 10.0, (w, h))
+    for frame in video_frames:
+        bgr_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        out.write(bgr_frame)
+    out.release()
+
+    with open(video_path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
+
 
 def _generate_agent_bbox_video(
     agent_id: str,
@@ -706,17 +1011,25 @@ def _generate_agent_bbox_video(
         agent_in_frame = next((a for a in epoch_agents[f_idx] if a.agent_id == agent_id), None)
 
         if agent_in_frame and agent_in_frame.side == primary_side:
-            mask = agent_in_frame.mask
+            mask = agent_in_frame.masks.get(primary_side)
             if mask is not None and np.any(mask):
                 coords = np.argwhere(mask)
                 y0, x0 = coords.min(axis=0)
                 y1, x1 = coords.max(axis=0) + 1
 
                 # Draw BBox
-                cv2.rectangle(img, (x0, y0), (x1, y1), (0, 255, 0), 2)
-                # Draw ID
-                cv2.putText(img, agent_id, (x0, max(0, y0-10)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                color = get_color_for_agent(agent_id)
+                cv2.rectangle(img, (x0, y0), (x1, y1), color, 3)
+
+                # Draw ID with background
+                text = agent_id
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 0.5
+                thickness = 1
+                (tw, th), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+                text_x, text_y = x0, max(0, y0 - 10)
+                cv2.rectangle(img, (text_x, text_y - th - baseline), (text_x + tw, text_y + baseline), color, -1)
+                cv2.putText(img, text, (text_x, text_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
         video_frames.append(img)
 
@@ -728,7 +1041,8 @@ def _generate_agent_bbox_video(
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(str(video_path), fourcc, 10.0, (w, h))
     for frame in video_frames:
-        out.write(frame)
+        bgr_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        out.write(bgr_frame)
     out.release()
 
     with open(video_path, "rb") as f:
@@ -803,7 +1117,7 @@ def _deduplicate_reason_payloads(reason_payloads: list[dict], target_count: int)
     return unique[:target_count]
 
 
-def _humanize_hazards(hazard_payload: str | dict) -> str:
+def _humanize_hazards(hazard_payload: Union[str, dict]) -> str:
     """Turn a hazards JSON (string or dict) into a concise human-readable block.
 
     This helps the synthesis judge see the concrete observations and avoid
@@ -831,7 +1145,11 @@ def _humanize_hazards(hazard_payload: str | dict) -> str:
         loc = h.get("location_relative", "unknown")
         obs = h.get("observation", "(no observation)")
         dr = h.get("danger_reasoning", "(no reasoning)")
-        lines.append(f"Hazard {i+1}: [{htype}] {obs} (obj:{oid}, loc:{loc})")
+        blind = "YES" if h.get("is_blind_spot") else "NO"
+        obstr = h.get("obstruction_level", "unknown")
+        dist = h.get("estimated_distance", "unknown")
+        lines.append(f"Hazard {i+1}: [{htype}] {obs} (obj:{oid}, loc:{loc}, dist:{dist})")
+        lines.append(f"  Blind Spot: {blind} | Obstruction: {obstr}")
         lines.append(f"  Mechanism: {dr}")
 
     return "\n".join(lines)
@@ -949,12 +1267,12 @@ def _extract_model_content(response) -> str:
 
 def _log_world_model_call(label: str, prompt: str, response) -> None:
     """Log the full request summary and the raw model output for each world-model call."""
-    # try:
-    #     msg_p = f"\n{'='*80}\n[PROMPT: {label}]\n{prompt}\n{'='*80}"
-    #     logger.info(msg_p)
-    #     print(msg_p)
-    # except Exception:
-    #     pass
+    try:
+        msg_p = f"\n{'='*80}\n[PROMPT: {label}]\n{prompt}\n{'='*80}"
+        logger.info(msg_p)
+        print(msg_p)
+    except Exception:
+        pass
 
     try:
         usage = getattr(response, "usage", None)
@@ -1011,6 +1329,7 @@ def generate_hazard_viz_video(
     """
     Generates a video visualization of the top 4 hazards identified in the risk assessment.
     Each hazard is highlighted by its segmentation mask with a distinct color.
+    Now supports composite 360° view and correct color spacing.
     """
     # 1. Identify the top 4 unique hazard IDs based on softmax weight
     valid_reasons = [r for r in reasons_detail if r["hazards"]]
@@ -1026,7 +1345,7 @@ def generate_hazard_viz_video(
             break
 
     COLORS = [
-        (0, 0, 255),   # Red
+        (0, 0, 255),   # Red (in BGR: Blue=0, Green=0, Red=255)
         (0, 165, 255), # Orange
         (0, 255, 255), # Yellow
         (255, 0, 255), # Magenta
@@ -1035,40 +1354,108 @@ def generate_hazard_viz_video(
     out_dir = Path(output_path).parent
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Determine available sides for composite view
+    target_sides = ['left', 'front', 'right', 'back']
+    available_sides = []
     if isinstance(frames, dict):
-        side = "front"
-        side_frames = frames[side]
-    else:
-        side_frames = frames
+        available_sides = [s for s in target_sides if s in frames]
+    elif isinstance(frames, list):
+        available_sides = ['front']
 
-    if not side_frames:
+    if not available_sides:
         return ""
 
-    h, w, _ = side_frames[0].shape
+    # Setup Video Writer based on the composite width
+    # We need to determine the width of one frame first and handle overlap correction
+    sample_frame = frames[available_sides[0]][0] if isinstance(frames, dict) else frames[0]
+    h, w_single, _ = sample_frame.shape
+
+    # Overlap correction: if side_overlap is configured, crop the margins
+    # The projected faces were sampled in range [-1-s, 1+s] and resized to w_single.
+    # The center 90-deg region is the middle 1/(1+s) fraction of the image.
+    import src.tasks.config.utils
+    overlap = src.tasks.config.utils.CONFIG["processing"].get("side_overlap", 0.0)
+
+    if overlap > 0:
+        # Calculate the pixel width of the overlap margin on each side
+        # The original FOV (90 deg) is 2 units wide. The sampled FOV is 2 + 2*overlap units wide.
+        # Margin on one side is 'overlap' units.
+        # Margin in pixels: (overlap / (2 + 2*overlap)) * w_single
+        margin = int((overlap / (2.0 + 2.0 * overlap)) * w_single)
+        effective_w = w_single - 2 * margin
+    else:
+        margin = 0
+        effective_w = w_single
+
+    total_w = effective_w * len(available_sides)
+
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     video_path = Path(output_path)
-    out = cv2.VideoWriter(str(video_path), fourcc, 10.0, (w, h))
+    out = cv2.VideoWriter(str(video_path), fourcc, 10.0, (total_w, h))
 
-    for f_idx in range(len(side_frames)):
-        img = side_frames[f_idx].copy()
-        frame_agents = epoch_agents[f_idx] if f_idx < len(epoch_agents) else []
+    for f_idx in range(len(epoch_agents)):
+        # 1. Build the composite frame
+        side_imgs = []
+        side_offsets = {}
+        current_offset = 0
+        for side in available_sides:
+            img = frames[side][f_idx] if isinstance(frames, dict) else frames[f_idx]
 
+            # Correct overlap: crop the margins from both sides
+            if overlap > 0:
+                img = img[:, margin : w_single - margin]
+
+            side_imgs.append(img)
+            side_offsets[side] = current_offset
+            current_offset += img.shape[1]
+
+        composite_img = np.hstack(side_imgs).copy()
+        frame_agents = epoch_agents[f_idx]
+
+        composite_img = np.hstack(side_imgs).copy()
+        frame_agents = epoch_agents[f_idx]
+
+        # 2. Draw Highlights for Top Hazards
         for rank, oid in enumerate(top_hazard_ids):
             color = COLORS[rank] if rank < len(COLORS) else (255, 255, 255)
             agent = next((a for a in frame_agents if a.agent_id == oid), None)
-            if agent and agent.mask is not None and np.any(agent.mask):
-                mask = agent.mask
-                overlay = img.copy()
-                overlay[mask] = color
-                cv2.addWeighted(overlay, 0.5, img, 0.5, 0, img)
-                coords = np.argwhere(mask)
-                y0, x0 = coords.min(axis=0)
-                y1, x1 = coords.max(axis=0) + 1
-                cv2.rectangle(img, (x0, y0), (x1, y1), color, 2)
-                label = f"Hazard {rank+1}: {agent.class_name}"
-                cv2.putText(img, label, (x0, max(0, y0-10)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-        out.write(img)
+
+            if agent:
+                for side in agent.fused_sides:
+                    if side in side_offsets:
+                        offset_x = side_offsets[side]
+                        mask = agent.masks.get(side)
+                        if mask is not None and np.any(mask):
+                            # Mask Overlay
+                            overlay = composite_img.copy()
+                            full_mask = np.zeros((h, total_w), dtype=bool)
+                            full_mask[:, offset_x : offset_x + (mask[:, margin:w_single-margin].shape[1] if overlap > 0 else mask.shape[1])] = (mask[:, margin:w_single-margin] if overlap > 0 else mask)
+
+                            overlay[full_mask] = color
+                            cv2.addWeighted(overlay, 0.5, composite_img, 0.5, 0, composite_img)
+
+                            # BBox and Label
+                            coords = np.argwhere(mask[:, margin:w_single-margin] if overlap > 0 else mask)
+                            y0, x0 = coords.min(axis=0)
+                            y1, x1 = coords.max(axis=0) + 1
+
+                            abs_x0, abs_x1 = x0 + offset_x, x1 + offset_x
+                            cv2.rectangle(composite_img, (abs_x0, y0), (abs_x1, y1), color, 3)
+                            label = f"Hazard {rank+1}: {agent.class_name}"
+
+                            # Label with background
+                            font = cv2.FONT_HERSHEY_SIMPLEX
+                            font_scale = 0.6
+                            thickness = 2
+                            (tw, th), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+                            text_x, text_y = abs_x0, max(0, y0 - 10)
+                            cv2.rectangle(composite_img, (text_x, text_y - th - baseline), (text_x + tw, text_y + baseline), color, -1)
+                            cv2.putText(composite_img, label, (text_x, text_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+        # 3. Correct Color Format: RGB -> BGR for OpenCV VideoWriter
+        final_frame = cv2.cvtColor(composite_img, cv2.COLOR_RGB2BGR)
+        out.write(final_frame)
+
     out.release()
 
     with open(video_path, "rb") as f:
@@ -1117,6 +1504,7 @@ class RiskAssessmentEngine:
         agents: list[DetectedAgent],
         image: np.ndarray,
         depth_map: np.ndarray,
+        side: str,
     ) -> tuple[dict[str, float], dict[str, Hazard]]:
         """
         Uses the RiskMapEngine to compute a risk score for each agent based on the spatial risk map.
@@ -1125,13 +1513,19 @@ class RiskAssessmentEngine:
         # We use the agents' existing masks to generate a risk map that reflects the current scene
         hazards_data = []
         for a in agents:
+            mask = a.masks.get(side)
+            if mask is None or not np.any(mask):
+                continue
             hazards_data.append({
                 "id": a.agent_id,
-                "mask": a.mask,
+                "mask": mask,
                 "score": a.seg_score,
                 "conf": a.seg_score,
                 "description": f"{a.class_name} agent"
             })
+
+        if not hazards_data:
+            return {}, {}
 
         risk_map, computed_hazards = self.risk_map_engine.generate_risk_map(image, depth_map, hazards_data)
 
@@ -1139,12 +1533,13 @@ class RiskAssessmentEngine:
         agent_hazards = {}
 
         for a in agents:
-            if a.mask is None or not np.any(a.mask):
+            mask = a.masks.get(side)
+            if mask is None or not np.any(mask):
                 agent_risks[a.agent_id] = 0.0
                 continue
 
             # Calculate mean risk value within the agent's mask
-            risk_vals = risk_map[a.mask]
+            risk_vals = risk_map[mask]
             agent_risks[a.agent_id] = float(np.mean(risk_vals))
 
             # Match to the computed Hazard object via ID (since we used agent_id in hazards_data)
@@ -1185,7 +1580,7 @@ class RiskAssessmentEngine:
         prompt: str,
         temperature: float,
         multimodal_items: Optional[list[dict]] = None,
-        max_tokens: int = 8192,
+        max_tokens: int = 16384,
         logprobs: bool = True,
         top_logprobs: Optional[int] = None,
     ) -> tuple[any, Optional[dict]]:
@@ -1220,6 +1615,13 @@ class RiskAssessmentEngine:
                     top_logprobs = top_logprobs,
                 )
                 last_response = response
+
+                # Check for truncation
+                finish_reason = response.choices[0].finish_reason
+                if finish_reason == "length":
+                    logger.warning("Attempt %d/%d: LLM response truncated (finish_reason='length'). Thinking may be too long for max_tokens=%d",
+                                   attempt, 5, max_tokens)
+
 
                 # Extract and clean content
                 content_str = _extract_model_content(response)
@@ -1258,8 +1660,10 @@ class RiskAssessmentEngine:
     # ------------------------------------------------------------------
     def _generate_reasons_with_logprobs(
         self,
-        scene_block: str,
+        context: dict,
         multimodal_items:   list[dict] = None,
+        valid_ids:          list[str] = None,
+        id_to_class:        dict[str, str] = None,
     ) -> list[tuple[str, float]]:
         """
         Calls the model N times independently (temperature > 0) to obtain N
@@ -1268,18 +1672,52 @@ class RiskAssessmentEngine:
         Calculates the weight P(r_i) for each reason using the softmax-normalized
         mean per-token log-probabilities.
         """
-        prompt = _build_reason_prompt(scene_block)
         reasons_data = []
         mean_lps = []
+        extracted_ids = []
 
         for i in range(self.n_reasons):
+            # Rebuild the scene block excluding already extracted IDs to force diversity
+            if context.get("is_epoch", False):
+                scene_block, current_multimodal = _build_epoch_scene_block(
+                    env_description = context["env_description"],
+                    epoch_agents    = context["epoch_agents"],
+                    frames          = context["frames"],
+                    telemetry       = context["telemetry"],
+                    agent_risks     = context.get("agent_risks"),
+                    epoch_id        = context.get("epoch_id", "latest"),
+                    exclude_ids     = extracted_ids
+                )
+            else:
+                scene_block, current_multimodal = _build_scene_block(
+                    env_description = context["env_description"],
+                    agents          = context["agents"],
+                    frames          = context["frames"],
+                    telemetry       = context["telemetry"],
+                    agent_risks     = context.get("agent_risks"),
+                    exclude_ids     = extracted_ids
+                )
+
+            # Use the filtered multimodal content for this specific sample
+            active_multimodal = []
+            if multimodal_items:
+                for item in multimodal_items:
+                    if item.get("agent_id") and item.get("agent_id") in extracted_ids:
+                        continue
+                    active_multimodal.append(item)
+            else:
+                active_multimodal = current_multimodal
+
+            prompt = _build_reason_prompt(scene_block, already_extracted_hazards=extracted_ids)
+
             # Use the retry helper for LLM call and JSON extraction
             response, reason_item = self._call_llm_with_retry(
                 prompt = prompt,
                 temperature = 0.9,
-                multimodal_items = multimodal_items,
+                multimodal_items = active_multimodal,
                 logprobs = True,
             )
+
 
             if response is None:
                 continue
@@ -1312,10 +1750,27 @@ class RiskAssessmentEngine:
             for h in reason_item.get("hazards", []):
                 if not isinstance(h, dict):
                     continue
+
+                # --- ID Correction Logic ---
+                if valid_ids is not None:
+                    orig_id = h.get("object_id")
+                    corrected_id = _correct_object_id(orig_id, valid_ids, id_to_class=id_to_class)
+                    h["object_id"] = corrected_id
+                # We can't easily get the list here without passing it in,
+                # but we can use the representative list if we modify the function signature
+                # or we can do a partial correction if we had the IDs.
+                # Since this is a method of RiskAssessmentEngine, we might need to pass the valid IDs.
+                # Let's first modify the function signature to accept valid_ids.
+
                 if isinstance(h.get("observation"), str):
                     h["observation"] = _strip_meta_preface(h.get("observation", "")).strip()
                 if isinstance(h.get("danger_reasoning"), str):
                     h["danger_reasoning"] = _strip_meta_preface(h.get("danger_reasoning", "")).strip()
+
+            # Track extracted IDs to prevent duplicates in subsequent samples
+            for h in reason_item.get("hazards", []):
+                if isinstance(h, dict) and h.get("object_id") and h.get("object_id") not in extracted_ids:
+                    extracted_ids.append(h["object_id"])
 
             # 2. Compute mean logprob for this reason
             tokens = list(choice.logprobs.content or [])
@@ -1610,6 +2065,7 @@ class RiskAssessmentEngine:
         depth_maps:      any = None,
         telemetry:       Optional[TelemetryData] = None,
         score_scale:     list[int] = [1, 2, 3, 4, 5],
+        epoch_id:        str = "latest",
     ) -> dict:
         """
         Processes all frames in segmented_items together to capture temporal dynamics.
@@ -1642,29 +2098,44 @@ class RiskAssessmentEngine:
             if isinstance(frames, dict):
                 for side in frames.keys():
                     img = frames[side][last_idx]
-                    dmap = depth_maps[side][last_idx]
-                    # Get agents for this frame and side
-                    frame_agents = [a for a in epoch_agents[last_idx] if a.side == side]
+                    dmap = depth_maps[side][1][last_idx]
+                    # Get agents for this frame that are present on this side
+                    frame_agents = [a for a in epoch_agents[last_idx] if side in a.fused_sides]
                     if frame_agents:
-                        risks, hazards = self._calculate_agent_risk_values(frame_agents, img, dmap)
+                        risks, hazards = self._calculate_agent_risk_values(frame_agents, img, dmap, side=side)
                         agent_risks.update(risks)
                         agent_hazards.update(hazards)
             else:
                 img = frames[last_idx]
-                dmap = depth_maps[last_idx]
+                dmap = depth_maps["front"][1][last_idx]
                 frame_agents = epoch_agents[last_idx]
                 risks, hazards = self._calculate_agent_risk_values(frame_agents, img, dmap)
                 agent_risks.update(risks)
                 agent_hazards.update(hazards)
 
-        scene_block, multimodal_content = _build_epoch_scene_block(
-            env_description, epoch_agents, frames, telemetry, agent_risks=agent_risks
+        # Build context for the reason sampler
+        scene_context = {
+            "is_epoch": True,
+            "env_description": env_description,
+            "epoch_agents": epoch_agents,
+            "frames": frames,
+            "telemetry": telemetry,
+            "agent_risks": agent_risks,
+            "epoch_id": epoch_id
+        }
+
+        # Initial multimodal content for the first sample
+        first_block, multimodal_content = _build_epoch_scene_block(
+            env_description, epoch_agents, frames, telemetry, agent_risks=agent_risks, epoch_id=epoch_id
         )
+        scene_block = first_block
 
         if len(multimodal_content) > 10:
             multimodal_content = multimodal_content[:10]
 
-        reasons = self._generate_reasons_with_logprobs(scene_block, multimodal_content)
+        valid_ids = [a.agent_id for a in all_agents_flat]
+        id_to_class = {a.agent_id: a.class_name for a in all_agents_flat}
+        reasons = self._generate_reasons_with_logprobs(scene_context, multimodal_content, valid_ids=valid_ids, id_to_class=id_to_class)
 
         if not reasons:
             sides_present = sorted(set(a.side for a in all_agents_flat))
@@ -1754,9 +2225,9 @@ class RiskAssessmentEngine:
                 for side in frames.keys():
                     img = frames[side][0] if isinstance(frames[side], list) else frames[side]
                     dmap = depth_map[side][0] if isinstance(depth_map[side], list) else depth_map[side]
-                    side_agents = [a for a in agents if a.side == side]
+                    side_agents = [a for a in agents if side in a.fused_sides]
                     if side_agents:
-                        risks, hazards = self._calculate_agent_risk_values(side_agents, img, dmap)
+                        risks, hazards = self._calculate_agent_risk_values(side_agents, img, dmap, side=side)
                         agent_risks.update(risks)
                         agent_hazards.update(hazards)
             else:
@@ -1764,14 +2235,27 @@ class RiskAssessmentEngine:
                 agent_risks.update(risks)
                 agent_hazards.update(hazards)
 
-        scene_block, multimodal_content = _build_scene_block(
+        # Build context for the reason sampler
+        scene_context = {
+            "is_epoch": False,
+            "env_description": env_description,
+            "agents": agents,
+            "frames": frames,
+            "telemetry": telemetry,
+            "agent_risks": agent_risks,
+        }
+
+        # Initial multimodal content for the first sample
+        _, multimodal_content = _build_scene_block(
             env_description, agents, frames, telemetry, agent_risks=agent_risks
         )
 
         if len(multimodal_content) > 10:
             multimodal_content = multimodal_content[:10]
 
-        reasons = self._generate_reasons_with_logprobs(scene_block, multimodal_content)
+        valid_ids = [a.agent_id for a in agents]
+        id_to_class = {a.agent_id: a.class_name for a in agents}
+        reasons = self._generate_reasons_with_logprobs(scene_context, multimodal_content, valid_ids=valid_ids, id_to_class=id_to_class)
 
         if not reasons:
             sides_present = sorted(set(a.side for a in agents))

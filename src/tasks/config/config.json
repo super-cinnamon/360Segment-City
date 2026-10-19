@@ -67,16 +67,17 @@
             "temperature": 0.7
         },
         "world_model": {
-            "model_name": "nvidia/Cosmos3-Edge",
+            "model_name": "nvidia/Cosmos3-Nano",
             "temperature": 0.5
         }
     },
     "processing": {
         "roi_enabled": true,
-        "roi_threshold": 0.7,
+        "roi_threshold": 0.4,
         "image_scale": 0.4,
         "prune_similar_frames": false,
-        "frame_similarity_threshold": 2.0
+        "frame_similarity_threshold": 2.0,
+        "side_overlap": 0.05
     },
     "risk_assessment": {
         "api_base": "http://localhost:5015/v1",
@@ -88,7 +89,7 @@
         "softmax_temperature": 0.7
     },
     "risk_map": {
-        "model_name": "nvidia/Cosmos3-Edge",
+        "model_name": "nvidia/Cosmos3-Nano",
         "weights": {
             "vlm": 0.4,
             "area": 0.2,
@@ -101,5 +102,21 @@
             "d_ref": 0.5
         },
         "prompt": "Identify all potential motorcycle hazards on the road. For each hazard, provide a risk score between 0 and 1 based on its immediate threat level and a brief description."
+    },
+    "fragment_merging": {
+        "enabled": true,
+        "ego_mask_path": "data/assets/ego_mask.png",
+        "mergeable_classes": ["person", "rider", "car", "truck", "bus", "motorcycle", "bicycle"],
+        "max_gap_px": 40,
+        "ego_overlap_min": 0.5,
+        "depth_rel_tol": 0.10,
+        "vertical_overlap_min": 0.6,
+        "max_merged_aspect_ratio": 3.0,
+        "min_score": 0.6,
+        "weights": {
+            "ego_occlusion": 0.5,
+            "depth_consistency": 0.3,
+            "boundary_alignment": 0.2
+        }
     }
 }

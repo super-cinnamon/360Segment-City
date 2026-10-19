@@ -9,7 +9,7 @@ base_dir = os.getcwd()
 external_dir = os.path.join(base_dir, 'external_tracking')
 sys.path.insert(0, external_dir)
 sys.path.insert(0, os.path.join(external_dir, 'lib'))
-sys.path.insert(0, os.path.join(base_dir, 'mock_detectron2'))
+sys.path.insert(0, os.path.join(external_dir, 'detectron2'))
 
 # Now import the actual OD logic
 from panoramic_detection import improved_OD as OD

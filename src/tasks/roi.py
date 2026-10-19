@@ -1,7 +1,11 @@
 import json
 import re
+import logging
 from collections import Counter
 from typing import Iterable, Optional, Sequence, Tuple
+
+logger = logging.getLogger(__name__)
+
 
 import cv2
 import numpy as np
@@ -75,6 +79,7 @@ def compute_roi_score(description: Optional[str]) -> Tuple[float, list[str]]:
     """Score the likelihood that the environment description represents a high-risk ROI."""
     cleaned = _normalize_text(description)
     if not cleaned:
+        logger.info(f"ROI compute: description is empty or null. Score=0.0")
         return 0.0, []
 
     matched_keywords: list[str] = []
@@ -93,8 +98,15 @@ def compute_roi_score(description: Optional[str]) -> Tuple[float, list[str]]:
         parsed_score = min(1.0, max(0.0, parsed_score))
         blended_score = min(1.0, 0.7 * parsed_score + 0.3 * normalized_keyword_score)
         combined_score = round(max(parsed_score, blended_score), 4)
+
+        logger.info(
+            f"ROI Score Breakdown: parsed={parsed_score:.4f}, "
+            f"keyword_raw={keyword_score:.2f}, keyword_norm={normalized_keyword_score:.4f}, "
+            f"blended={blended_score:.4f}, final={combined_score:.4f}"
+        )
         return combined_score, matched_keywords
 
+    logger.info(f"ROI Score Breakdown: No parsed score found. keyword_norm={normalized_keyword_score:.4f}, final={normalized_keyword_score:.4f}")
     return round(normalized_keyword_score, 4), matched_keywords
 
 
@@ -105,8 +117,14 @@ def should_process_window(
 ) -> bool:
     if not roi_enabled:
         return True
-    score, _ = compute_roi_score(description)
-    return score >= roi_threshold
+    score, matched = compute_roi_score(description)
+    decision = score >= roi_threshold
+    logger.info(
+        f"ROI Check: score={score:.4f} (threshold={roi_threshold:.4f}), "
+        f"decision={decision}, matched_keywords={matched}, "
+        f"description={description}"
+    )
+    return decision
 
 
 DEFAULT_IMAGE_SCALE = float(CONFIG.get("processing", {}).get("image_scale", 0.7))

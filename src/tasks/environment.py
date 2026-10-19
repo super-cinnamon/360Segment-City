@@ -4,6 +4,7 @@ import multiprocessing as mp
 import os
 import sys
 import base64
+from typing import Optional
 
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
@@ -16,7 +17,10 @@ import cv2
 from PIL import Image
 
 from matplotlib import image
-import ollama
+try:
+    import ollama
+except ImportError:
+    ollama = None
 import torch
 
 from transformers import (
@@ -33,6 +37,7 @@ is_windows = sys.platform.startswith('win')
 # if not is_windows:
 #     from vllm import LLM, SamplingParams
 
+# Cache for loaded world models, keyed by model name to support multiple models
 LOADED_MODEL = {}
 
 ## Query the model
@@ -55,9 +60,12 @@ def query_ollama_vlm(prompt=ENV_PROMPT, images=[], model=CONFIG["vlm"]["ollama"]
 
 
 def load_world_model(model=CONFIG["vlm"]["world_model"]["model_name"]):
+    """
+    Loads the world model and caches it by its name to support switching between models.
+    """
     # Load the world model
-    if "world_model" in LOADED_MODEL:
-        return LOADED_MODEL["world_model"]
+    if model in LOADED_MODEL:
+        return LOADED_MODEL[model]
 
     # Use the same Hugging Face-based loading path on Linux as on Windows.
     world_model_processor = AutoProcessor.from_pretrained(model)
@@ -68,9 +76,27 @@ def load_world_model(model=CONFIG["vlm"]["world_model"]["model_name"]):
     ).to(DEVICE)
     world_model.eval()
     world_model_tokenizer = world_model_processor.tokenizer
-    LOADED_MODEL["world_model"] = (world_model, world_model_processor, world_model_tokenizer)
+    LOADED_MODEL[model] = (world_model, world_model_processor, world_model_tokenizer)
 
     return world_model, world_model_processor, world_model_tokenizer
+
+def unload_world_model(model_name: Optional[str] = None):
+    """
+    Removes a specific world model or all world models from the cache and clears VRAM.
+    """
+    global LOADED_MODEL
+    if model_name:
+        if model_name in LOADED_MODEL:
+            del LOADED_MODEL[model_name]
+    else:
+        LOADED_MODEL.clear()
+
+    import gc
+    import torch
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
 
 # * here we query the world model to describe the environment, we will be adding the segmentation of the static objects in the prompt here, will be completed next time
 def query_world_model(prompt=ENV_PROMPT, images=[], model=CONFIG["vlm"]["world_model"]["model_name"]):

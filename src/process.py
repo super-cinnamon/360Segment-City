@@ -1,6 +1,7 @@
 # for parallel processing
+import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Optional
+from typing import Optional, Union
 import os
 import pickle
 from pathlib import Path
@@ -22,21 +23,23 @@ from src.tasks.flow_estimation import (
 )
 from src.tasks.segmentation import predict_segmentations, predict_cubic_segmentations
 from src.tasks.id_tracker import ObjectIDTracker
-from src.tasks.environment import query_world_model
+from src.tasks.environment import query_world_model, unload_world_model
 from src.tasks.risk_assessment import (
     RiskAssessmentEngine,
     TelemetryData,
     compute_depth_bounds,
 )
 from src.tasks.risk_map import RiskMapEngine
+logger = logging.getLogger(__name__)
+
 from src.tasks.roi import (
     build_static_objects_summary,
-
     resize_frames,
     should_process_window,
 )
 
 from src.tasks.config.utils import CONFIG, ENV_PROMPT, render_environment_prompt
+from src.tasks.fragment_merger import FragmentMerger
 
 class VideoLoader:
     def __init__(self, video_path):
@@ -202,10 +205,11 @@ class SegmentationPipeline:
         print("DEBUG: VideoLoader initialized", flush=True)
         self.video_processor = VideoProcessor(self.video_loader, cubic=cubic)
         print("DEBUG: VideoProcessor initialized", flush=True)
+        self.fragment_merger = FragmentMerger()
         print("DEBUG: SegmentationPipeline.__init__ end", flush=True)
 
     # ! update and fix whatever copilot messed with here and write proper code
-    def _get_image_scale(self, image_scale: float | None = None) -> float:
+    def _get_image_scale(self, image_scale: Optional[float] = None) -> float:
         if image_scale is not None:
             try:
                 image_scale = float(image_scale)
@@ -221,7 +225,7 @@ class SegmentationPipeline:
             image_scale = 0.7
         return max(0.0, min(1.0, image_scale))
 
-    def _prepare_frames_for_inference(self, frames, image_scale: float | None = None):
+    def _prepare_frames_for_inference(self, frames, image_scale: Optional[float] = None):
         scale = self._get_image_scale(image_scale)
         if self.video_processor.cubic:
             if isinstance(frames, dict):
@@ -277,7 +281,7 @@ class SegmentationPipeline:
 
         return segmented_items
 
-    def process_vision(self, object_name=None, image_scale: float | None = None):
+    def process_vision(self, object_name=None, image_scale: Optional[float] = None):
         # Backwards-compatible default behaviour (no frames provided): run as before
         if self.video_loader.frames is None:
             self.video_loader.frames = self.video_loader.get_split_frames()
@@ -347,16 +351,47 @@ class SegmentationPipeline:
                     })
             # prune segmentation items based on score and relevant labels
             frame_segments, environment_segments = self.prune_segmentation(frame_segments)
+            print(f"DEBUG: Frame {i} - After score prune: {len(frame_segments)} agents")
             segmented_items.append(frame_segments)
             environment_items.append(environment_segments)
         # prune segmentation items based on depth
+        if CONFIG.get("fragment_merging", {}).get("enabled", True):
+            # Merge occluder-split fragments before depth pruning
+            for i in range(len(segmented_items)):
+                # Get frame dimensions from the first available depth map
+                first_side = list(depth_masks.keys())[0]
+
+                # depth_masks[first_side][1] is a list of depth maps (one per frame)
+                # We need the depth map for the current frame index i
+                depth_frame = depth_masks[first_side][1][i]
+                if depth_frame is None:
+                    continue
+                h, w = depth_frame.shape[:2]
+
+                for key in depth_masks.keys():
+                    side_segments = [s for s in segmented_items[i] if s["side"] == key]
+                    if len(side_segments) < 2:
+                        continue
+
+                    merged = self.fragment_merger.merge_fragments(
+                        side_segments,
+                        depth_masks[key][1][i],
+                        w, h
+                    )
+                    if len(merged) < len(side_segments):
+                        logger.info(f"Frame {i} [{key}]: Merged fragments. {len(side_segments)} -> {len(merged)}")
+
+                    # Replace old segments with merged ones
+                    segmented_items[i] = [s for s in segmented_items[i] if s["side"] != key] + merged
+
         segmented_items = self.prune_depth(segmented_items)
+        print(f"DEBUG: After depth prune - Total frames with agents: {sum(1 for f in segmented_items if f)}")
         environment_items = self.prune_depth(environment_items)
 
         return segmented_items, environment_items, depth_masks
 
     # * is the same as the function i wrote above, but just takes specific frames as input, above function will be removed later
-    def process_vision_for(self, frames, object_name=None, prepared_frames=None, image_scale: float | None = None, epoch_idx=None, raw_start=None, raw_end=None):
+    def process_vision_for(self, frames, object_name=None, prepared_frames=None, image_scale: Optional[float] = None, epoch_idx=None, raw_start=None, raw_end=None):
         """
         Process a provided list of frames (or cubic dict) and return segmented items.
         This allows sliding-window processing without changing the core logic.
@@ -449,10 +484,41 @@ class SegmentationPipeline:
                     })
             # prune segmentation items based on score and relevant labels
             frame_segments, environment_segments = self.prune_segmentation(frame_segments)
+            print(f"DEBUG: Frame {i} - After score prune: {len(frame_segments)} agents")
             segmented_items.append(frame_segments)
             environment_items.append(environment_segments)
         # prune segmentation items based on depth
+        if CONFIG.get("fragment_merging", {}).get("enabled", True):
+            # Merge occluder-split fragments before depth pruning
+            for i in range(len(segmented_items)):
+                # Get frame dimensions from the first available depth map
+                first_side = list(depth_masks.keys())[0]
+
+                # depth_masks[first_side][1] is a list of depth maps (one per frame)
+                # We need the depth map for the current frame index i
+                depth_frame = depth_masks[first_side][1][i]
+                if depth_frame is None:
+                    continue
+                h, w = depth_frame.shape[:2]
+
+                for key in depth_masks.keys():
+                    side_segments = [s for s in segmented_items[i] if s["side"] == key]
+                    if len(side_segments) < 2:
+                        continue
+
+                    merged = self.fragment_merger.merge_fragments(
+                        side_segments,
+                        depth_masks[key][1][i],
+                        w, h
+                    )
+                    if len(merged) < len(side_segments):
+                        logger.info(f"Frame {i} [{key}]: Merged fragments. {len(side_segments)} -> {len(merged)}")
+
+                    # Replace old segments with merged ones
+                    segmented_items[i] = [s for s in segmented_items[i] if s["side"] != key] + merged
+
         segmented_items = self.prune_depth(segmented_items)
+        print(f"DEBUG: After depth prune - Total frames with agents: {sum(1 for f in segmented_items if f)}")
         environment_items = self.prune_depth(environment_items)
 
         return segmented_items, environment_items, depth_masks
@@ -553,12 +619,14 @@ class SegmentationPipeline:
             prompt=prompt,
             prepared_frames=prepared_frames,
         )
+
         risk_result = self.process_risk(
             segmented_items,
             refined_environment_description,
             frames=prepared_frames,
             depth_masks=depth_masks,
             telemetry=telemetry,
+            epoch_idx=epoch_idx,
         )
 
         return {
@@ -580,7 +648,8 @@ class SegmentationPipeline:
             telemetry: Optional[TelemetryData] = None,
             api_base: str = CONFIG["risk_assessment"]["api_base"],
             model_name: str = CONFIG["risk_assessment"]["model_name"],
-        ) -> list[dict] | dict:
+            epoch_idx: Optional[int] = None,
+        ) -> Union[list[dict], dict]:
             """
             Runs G-VEval risk assessment across the batch of frames as an "epoch" window.
 
@@ -613,6 +682,7 @@ class SegmentationPipeline:
                 frames=frames,
                 depth_maps=depth_masks,
                 telemetry=telemetry,
+                epoch_id=f"epoch_{epoch_idx}" if epoch_idx is not None else "latest",
             )
 
             # Generate Hazard Visualization Video
@@ -623,7 +693,7 @@ class SegmentationPipeline:
                     build_agents_from_segments(f, d_min, d_max) for f in segmented_items
                 ]
 
-                viz_path = f"outputs/risk_viz/hazard_viz_{os.getpid()}.mp4"
+                viz_path = f"outputs/risk_viz/hazard_viz_{epoch_idx}.mp4" if epoch_idx is not None else f"outputs/risk_viz/hazard_viz_{os.getpid()}.mp4"
                 generate_hazard_viz_video(
                     output_path=viz_path,
                     frames=frames,

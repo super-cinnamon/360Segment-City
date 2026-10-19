@@ -48,7 +48,7 @@ Analyze the image carefully and output your response ONLY as a single, valid JSO
 8. ENVIRONMENT_RISK_SCORE:
    - Estimate the scene's immediate risk for the rider on a continuous scale from 0.0 to 1.0.
    - Use 0.0 for very low-risk, clear-road scenes and 1.0 for very high-risk scenes.
-   - Consider traffic density, pedestrians, crossings, traffic signals, road complexity, weather, visibility, and proximity of nearby road users.
+   - Consider traffic density, pedestrians, crossings, traffic signals, road complexity, weather, visibility, and the presence and proximity of road actors (e.g., cars, two-wheelers, and pedestrians).
 
 ---
 
