@@ -157,6 +157,8 @@ class TelemetryData:
     pet       : Post Encroachment Time (seconds)   — derived from sensor fusion
     d_lat     : Lateral distance to nearest agent (metres)
     v_rel     : Relative speed to nearest agent (m/s)
+    speed_ms    : Ego-motorcycle speed (m/s)
+    speed_kmh   : Ego-motorcycle speed (km/h)
     a_ego     : Ego-motorcycle longitudinal acceleration (m/s²) — from IMU
     roll      : Roll angle (degrees)               — from IMU
     yaw_rate  : Yaw rate (deg/s)                   — from IMU
@@ -165,6 +167,8 @@ class TelemetryData:
     pet:      float
     d_lat:    float
     v_rel:    float
+    speed_ms:   float
+    speed_kmh:  float
     a_ego:    float
     roll:     float
     yaw_rate: float
@@ -448,7 +452,8 @@ def _build_epoch_scene_block(
     if telemetry is not None:
         telemetry_block = (
             f"  TTC={telemetry.ttc:.2f}s  |  PET={telemetry.pet:.2f}s  |  "
-            f"v_rel={telemetry.v_rel:.1f} m/s  |  d_lat={telemetry.d_lat:.1f} m  |  "
+            f"Speed={telemetry.speed_kmh:.1f} km/h  |  v_rel={telemetry.v_rel:.1f} m/s  |  "
+            f"d_lat={telemetry.d_lat:.1f} m  |  "
             f"roll={telemetry.roll:.1f}°  |  yaw_rate={telemetry.yaw_rate:.1f} °/s"
         )
     else:
@@ -556,7 +561,8 @@ def _build_scene_block(
     if telemetry is not None:
         telemetry_block = (
             f"  TTC={telemetry.ttc:.2f}s  |  PET={telemetry.pet:.2f}s  |  "
-            f"v_rel={telemetry.v_rel:.1f} m/s  |  d_lat={telemetry.d_lat:.1f} m  |  "
+            f"Speed={telemetry.speed_kmh:.1f} km/h  |  v_rel={telemetry.v_rel:.1f} m/s  |  "
+            f"d_lat={telemetry.d_lat:.1f} m  |  "
             f"roll={telemetry.roll:.1f}°  |  yaw_rate={telemetry.yaw_rate:.1f} °/s"
         )
     else:
@@ -1325,15 +1331,20 @@ def generate_hazard_viz_video(
     frames: any,
     epoch_agents: list[list[DetectedAgent]],
     reasons_detail: list[dict],
+    epoch_telemetry: Optional[list[TelemetryData]] = None,
 ) -> str:
     """
     Generates a video visualization of the top 4 hazards identified in the risk assessment.
     Each hazard is highlighted by its segmentation mask with a distinct color.
-    Now supports composite 360° view and correct color spacing.
+    Now supports composite 360° view and correct color spacing, plus telemetry overlay.
     """
     # 1. Identify the top 4 unique hazard IDs based on softmax weight
-    valid_reasons = [r for r in reasons_detail if r["hazards"]]
-    sorted_reasons = sorted(valid_reasons, key=lambda r: r["softmax_weight"], reverse=True)
+    valid_reasons = [r for r in reasons_detail if r.get("hazards")]
+    sorted_reasons = sorted(
+        valid_reasons,
+        key=lambda r: r.get("softmax_weight", r.get("weight", 0.0)),
+        reverse=True
+    )
 
     top_hazard_ids = []
     for r in sorted_reasons:
@@ -1389,9 +1400,21 @@ def generate_hazard_viz_video(
 
     total_w = effective_w * len(available_sides)
 
+    telemetry_bar_h = 100 if epoch_telemetry else 0
+    total_h = h + telemetry_bar_h
+
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     video_path = Path(output_path)
-    out = cv2.VideoWriter(str(video_path), fourcc, 10.0, (total_w, h))
+    out = cv2.VideoWriter(str(video_path), fourcc, 10.0, (total_w, total_h))
+
+    # Telemetry plot configuration
+    metrics = [
+        {"name": "Speed (km/h)", "key": "speed_kmh", "color": (0, 255, 0), "min": 0, "max": 120},
+        {"name": "Roll (deg)", "key": "roll", "color": (255, 0, 0), "min": -30, "max": 30},
+        {"name": "Yaw Rate (deg/s)", "key": "yaw_rate", "color": (0, 255, 255), "min": -60, "max": 60},
+        {"name": "Accel (m/s²)", "key": "a_ego", "color": (255, 0, 255), "min": -5, "max": 5},
+    ]
+
 
     for f_idx in range(len(epoch_agents)):
         # 1. Build the composite frame
@@ -1412,8 +1435,32 @@ def generate_hazard_viz_video(
         composite_img = np.hstack(side_imgs).copy()
         frame_agents = epoch_agents[f_idx]
 
-        composite_img = np.hstack(side_imgs).copy()
-        frame_agents = epoch_agents[f_idx]
+        # Draw Telemetry Bar
+        if epoch_telemetry:
+            bar = np.zeros((telemetry_bar_h, total_w, 3), dtype=np.uint8)
+            num_metrics = len(metrics)
+            slot_w = total_w // num_metrics
+            for i, m in enumerate(metrics):
+                x_start = i * slot_w
+                x_end = (i + 1) * slot_w
+                # Draw slot background
+                cv2.rectangle(bar, (x_start, 0), (x_end, telemetry_bar_h), (40, 40, 40), -1)
+                cv2.putText(bar, m["name"], (x_start + 5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
+
+                # Draw sparkline
+                points = []
+                for f_idx_plot in range(f_idx + 1):
+                    val = getattr(epoch_telemetry[f_idx_plot], m["key"], 0.0)
+                    norm_val = (val - m["min"]) / (m["max"] - m["min"])
+                    y = telemetry_bar_h - 10 - (norm_val * (telemetry_bar_h - 40))
+                    x = x_start + 10 + (f_idx_plot / (len(epoch_agents) - 1) * (slot_w - 20)) if len(epoch_agents) > 1 else x_start + 10
+                    points.append((int(x), int(y)))
+
+                if len(points) >= 2:
+                    cv2.polylines(bar, [np.array(points, np.int32)], False, m["color"], 2, cv2.LINE_AA)
+
+            composite_img = np.vstack([bar, composite_img])
+
 
         # 2. Draw Highlights for Top Hazards
         for rank, oid in enumerate(top_hazard_ids):

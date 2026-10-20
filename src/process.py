@@ -38,6 +38,7 @@ from src.tasks.roi import (
     should_process_window,
 )
 
+from src.telemetry import TelemetryProcessor
 from src.tasks.config.utils import CONFIG, ENV_PROMPT, render_environment_prompt
 from src.tasks.fragment_merger import FragmentMerger
 
@@ -199,8 +200,19 @@ class VideoProcessor:
     
 
 class SegmentationPipeline:
-    def __init__(self, video_path, cubic=True):
+    def __init__(self, input_path, cubic=True):
         print("DEBUG: SegmentationPipeline.__init__ start", flush=True)
+
+        # Resolve video path if input_path is a directory (Support for telemetry-enabled runs)
+        if os.path.isdir(input_path):
+            video_path = os.path.join(input_path, "360_video.mp4")
+            logger.info(f"Directory input detected: {input_path}. Initializing TelemetryProcessor.")
+            self.telemetry_processor = TelemetryProcessor(input_path)
+        else:
+            video_path = input_path
+            logger.info(f"File input detected: {input_path}. Telemetry disabled (no directory provided).")
+            self.telemetry_processor = None
+
         self.video_loader = VideoLoader(video_path)
         print("DEBUG: VideoLoader initialized", flush=True)
         self.video_processor = VideoProcessor(self.video_loader, cubic=cubic)
@@ -581,6 +593,14 @@ class SegmentationPipeline:
         if roi_threshold is None:
             roi_threshold = float(CONFIG.get("processing", {}).get("roi_threshold", 0.75))
 
+        # Fetch telemetry for this epoch if processor is available
+        if telemetry is None and self.telemetry_processor is not None:
+            telemetry = self.telemetry_processor.get_epoch_telemetry(epoch_idx if epoch_idx is not None else 0)
+            if telemetry:
+                logger.debug(f"Epoch {epoch_idx}: Telemetry data successfully injected.")
+            else:
+                logger.debug(f"Epoch {epoch_idx}: No telemetry data available for this window.")
+
         prepared_frames = self._prepare_frames_for_inference(frames)
         environment_description = self.process_environment_for(
             frames,
@@ -693,12 +713,33 @@ class SegmentationPipeline:
                     build_agents_from_segments(f, d_min, d_max) for f in segmented_items
                 ]
 
+                # Extract per-frame telemetry for the epoch if available
+                epoch_telemetry = None
+                if self.telemetry_processor and epoch_idx is not None:
+                    df = self.telemetry_processor.data
+                    start = epoch_idx * 30
+                    end = start + 30
+                    if start < len(df):
+                        epoch_df = df.iloc[start:end]
+                        epoch_telemetry = [
+                            TelemetryData(
+                                ttc=0.0, pet=0.0, d_lat=0.0, v_rel=0.0,
+                                speed_ms=float(row['speed_ms']) if 'speed_ms' in row else 0.0,
+                                speed_kmh=float(row['speed_kmh']) if 'speed_kmh' in row else 0.0,
+                                a_ego=float(row['a_x']) if 'a_x' in row else 0.0,
+                                roll=float(row['roll']) if 'roll' in row else 0.0,
+                                yaw_rate=float(row['gy_z']) if 'gy_z' in row else 0.0,
+                            )
+                            for _, row in epoch_df.iterrows()
+                        ]
+
                 viz_path = f"outputs/risk_viz/hazard_viz_{epoch_idx}.mp4" if epoch_idx is not None else f"outputs/risk_viz/hazard_viz_{os.getpid()}.mp4"
                 generate_hazard_viz_video(
                     output_path=viz_path,
                     frames=frames,
                     epoch_agents=epoch_agents,
-                    reasons_detail=risk_result.get("reasons", [])
+                    reasons_detail=risk_result.get("reasons", []),
+                    epoch_telemetry=epoch_telemetry,
                 )
                 risk_result["viz_video_path"] = viz_path
             except Exception as e:

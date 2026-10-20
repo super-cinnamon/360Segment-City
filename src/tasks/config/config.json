@@ -75,6 +75,7 @@
         "roi_enabled": true,
         "roi_threshold": 0.4,
         "image_scale": 0.4,
+        "use_imu_telemetry": true,
         "prune_similar_frames": false,
         "frame_similarity_threshold": 2.0,
         "side_overlap": 0.05
