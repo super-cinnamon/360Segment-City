@@ -15,6 +15,7 @@ from src.tasks.depth_estimation import (
     get_closest_depth_mask,
     predict_cubic_depths,
     mode_depth,
+    get_depth_mode,
 )
 from src.tasks.flow_estimation import (
     predict_flows,
@@ -124,7 +125,10 @@ class VideoProcessor:
 
     def get_depth_mask_for(self, frames, epoch_idx=None, raw_start=None, raw_end=None):
         # New API: compute depths for either cubic dict or list of frames
-        cache_path = self._get_cache_path("depth", epoch_idx, raw_start, raw_end)
+        depth_cache_prefix = "depth_yolo" if get_depth_mode() == "yolo" else "depth"
+        cache_path = self._get_cache_path(
+            depth_cache_prefix, epoch_idx, raw_start, raw_end
+        )
         if cache_path and cache_path.exists():
             with open(cache_path, "rb") as f:
                 return pickle.load(f)
@@ -770,4 +774,3 @@ class SegmentationPipeline:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-

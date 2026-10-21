@@ -1,12 +1,20 @@
 {
     "depth_estimation": {
-        "model_name": "prs-eth/marigold-lcm-v1-0",
-        "pipeline_name": "marigold_depth_estimation",
-        "hyperparameters": {
-            "denoising_steps": 4,
-            "ensemble_size": 5,
-            "processing_res": 768,
-            "match_input_res": true
+        "mode": "marigold",
+        "models": {
+            "marigold": {
+                "model_name": "prs-eth/marigold-lcm-v1-0",
+                "pipeline_name": "marigold_depth_estimation",
+                "hyperparameters": {
+                    "denoising_steps": 4,
+                    "ensemble_size": 5,
+                    "processing_res": 768,
+                    "match_input_res": true
+                }
+            },
+            "yolo": {
+                "model_name": "yolo26x-depth.pt"
+            }
         }
     },
     "flow_estimation": {
@@ -110,16 +118,14 @@
     },
     "fragment_merging": {
         "enabled": true,
-        "ego_mask_path": "data/assets/ego_mask.png",
         "mergeable_classes": ["person", "rider", "car", "truck", "bus", "motorcycle", "bicycle"],
         "max_gap_px": 40,
-        "ego_overlap_min": 0.5,
         "depth_rel_tol": 0.10,
         "vertical_overlap_min": 0.6,
         "max_merged_aspect_ratio": 3.0,
         "min_score": 0.6,
         "weights": {
-            "ego_occlusion": 0.5,
+            "proximity": 0.5,
             "depth_consistency": 0.3,
             "boundary_alignment": 0.2
         }

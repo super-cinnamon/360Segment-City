@@ -63,7 +63,7 @@ _DEFAULT_MODEL    = _RA_CFG["model_name"]
 _DEFAULT_N        = int(_RA_CFG.get("n_reasons", 5))
 _NORMALIZE_SCORES = _RA_CFG.get("normalize_scores", True)
 _SOFTMAX_TEMP     = float(_RA_CFG.get("softmax_temperature", 0.7))
-_SIDE_OVERLAP_MATCHER = FragmentMerger(load_ego_mask=False)
+_SIDE_OVERLAP_MATCHER = FragmentMerger()
 
 # ---------------------------------------------------------------------------
 # G-Eval Evaluation Criteria

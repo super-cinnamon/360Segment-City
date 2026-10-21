@@ -12,13 +12,32 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from src.tasks.config.utils import CONFIG, DEVICE
 
 
-def load_pipeline(
-    model_name=CONFIG["depth_estimation"]["model_name"],
-    device=DEVICE
-    ):
+def get_depth_mode():
+    mode = CONFIG["depth_estimation"].get("mode", "marigold")
+    if not isinstance(mode, str) or mode.lower() not in {"marigold", "yolo"}:
+        raise ValueError(
+            "depth_estimation.mode must be either 'marigold' or 'yolo'"
+        )
+    return mode.lower()
+
+
+def get_depth_model_config(mode=None):
+    selected_mode = get_depth_mode() if mode is None else mode
+    try:
+        return CONFIG["depth_estimation"]["models"][selected_mode]
+    except KeyError as error:
+        raise ValueError(
+            f"Missing configuration for depth estimation mode '{selected_mode}'"
+        ) from error
+
+
+def load_pipeline(model_config=None, device=DEVICE):
+    if model_config is None:
+        model_config = get_depth_model_config("marigold")
+
     pipe = DiffusionPipeline.from_pretrained(
-        model_name,
-        custom_pipeline="marigold_depth_estimation"
+        model_config["model_name"],
+        custom_pipeline=model_config["pipeline_name"],
     )
 
     pipe = pipe.to(device)
@@ -28,10 +47,12 @@ def load_pipeline(
 
 # Lazy pipeline to avoid consuming GPU at import time
 _depth_estimation_pipeline = None
+_yolo_depth_model = None
 
 def unload_model():
-    global _depth_estimation_pipeline
+    global _depth_estimation_pipeline, _yolo_depth_model
     _depth_estimation_pipeline = None
+    _yolo_depth_model = None
     import torch
     import gc
     gc.collect()
@@ -43,16 +64,92 @@ def unload_model():
 def _get_depth_pipeline():
     global _depth_estimation_pipeline
     if _depth_estimation_pipeline is None:
-        _depth_estimation_pipeline = load_pipeline()
+        _depth_estimation_pipeline = load_pipeline(
+            get_depth_model_config("marigold")
+        )
     return _depth_estimation_pipeline
 
 
-def predict_depth(image, pipe=None, hyperparameters=CONFIG["depth_estimation"]["hyperparameters"]):
+def _get_yolo_depth_model():
+    global _yolo_depth_model
+    if _yolo_depth_model is None:
+        from ultralytics import YOLO
+
+        model_config = get_depth_model_config("yolo")
+        _yolo_depth_model = YOLO(model_config["model_name"])
+    return _yolo_depth_model
+
+
+def _get_configured_depth_model():
+    if get_depth_mode() == "yolo":
+        return _get_yolo_depth_model()
+    return _get_depth_pipeline()
+
+
+def _prepare_yolo_depth(depth, image_shape):
+    if hasattr(depth, "data"):
+        depth = depth.data
+    if isinstance(depth, torch.Tensor):
+        depth = depth.detach().cpu().numpy()
+
+    depth = np.asarray(depth)
+    while depth.ndim > 2 and depth.shape[0] == 1:
+        depth = depth[0]
+    if depth.ndim == 3 and depth.shape[-1] == 1:
+        depth = depth[..., 0]
+    if depth.ndim != 2:
+        raise ValueError(f"Expected a 2D YOLO depth map, got shape {depth.shape}")
+
+    valid = np.isfinite(depth)
+    if not np.any(valid):
+        raise ValueError("YOLO returned a depth map with no finite values")
+
+    depth = depth.astype(np.float32, copy=True)
+    depth[~valid] = float(depth[valid].max())
+
+    height, width = image_shape[:2]
+    if depth.shape != (height, width):
+        depth = cv2.resize(depth, (width, height), interpolation=cv2.INTER_LINEAR)
+
+    min_depth = float(depth.min())
+    max_depth = float(depth.max())
+    normalized_depth = np.ones((height, width), dtype=np.float32)
+    if max_depth > min_depth:
+        normalized_depth = (depth - min_depth) / (max_depth - min_depth)
+    else:
+        normalized_depth.fill(0.0)
+    return normalized_depth
+
+
+def predict_depth(image, pipe=None, hyperparameters=None):
     # make image into PIL Image
     input_image = Image.fromarray(image)
 
+    if get_depth_mode() == "yolo":
+        if pipe is None:
+            pipe = _get_configured_depth_model()
+
+        with torch.no_grad():
+            results = pipe(input_image, device=DEVICE, verbose=False)
+
+        if not results or getattr(results[0], "depth", None) is None:
+            raise ValueError("YOLO depth model did not return a depth map")
+
+        depth_pred = _prepare_yolo_depth(results[0].depth, image.shape)
+        from diffusers.pipelines.marigold.marigold_image_processing import (
+            MarigoldImageProcessor,
+        )
+
+        depth_colored = MarigoldImageProcessor.visualize_depth(
+            depth_pred, color_map="Spectral"
+        )[0]
+        return depth_colored, depth_pred
+
     if pipe is None:
         pipe = _get_depth_pipeline()
+
+    if hyperparameters is None:
+        hyperparameters = get_depth_model_config("marigold")["hyperparameters"]
 
     with torch.no_grad():
         # Predict depth
@@ -74,12 +171,12 @@ def predict_depth(image, pipe=None, hyperparameters=CONFIG["depth_estimation"]["
     return depth_colored, depth_pred
 
 
-def predict_depths(images, pipe=None, hyperparameters=CONFIG["depth_estimation"]["hyperparameters"]):
+def predict_depths(images, pipe=None, hyperparameters=None):
     depth_output_images = []
     depth_output_predictions = []
     with torch.no_grad():
         if pipe is None:
-            pipe = _get_depth_pipeline()
+            pipe = _get_configured_depth_model()
 
         for input_image in tqdm(images, desc=f"Estimating depth", leave=True):
             # Predict depth
@@ -94,7 +191,7 @@ def predict_depths(images, pipe=None, hyperparameters=CONFIG["depth_estimation"]
 
 def predict_cubic_depths(cubic_frames, pipe=None, PARALLEL=False):
     if pipe is None:
-        pipe = _get_depth_pipeline()
+        pipe = _get_configured_depth_model()
 
     left_depths = predict_depths(cubic_frames["left"], pipe)
     right_depths = predict_depths(cubic_frames["right"], pipe)
@@ -155,4 +252,3 @@ def mode_depth(depth_map, segmentation_mask):
 
 
     return mode_depth
-
