@@ -209,4 +209,6 @@ __marimo__/
 
 data/
 outputs/
-ouptput/
+output/
+viz_results/
+tests/ 

@@ -32,6 +32,7 @@ References
 import re
 import json
 import math
+import hashlib
 import logging
 import cv2
 import base64
@@ -44,6 +45,7 @@ from typing import Optional, Union
 
 from src.tasks.risk_map import RiskMapEngine, Hazard
 from src.tasks.config.utils import CONFIG
+from src.tasks.fragment_merger import FragmentMerger
 
 # Module logger
 logger = logging.getLogger(__name__)
@@ -61,6 +63,7 @@ _DEFAULT_MODEL    = _RA_CFG["model_name"]
 _DEFAULT_N        = int(_RA_CFG.get("n_reasons", 5))
 _NORMALIZE_SCORES = _RA_CFG.get("normalize_scores", True)
 _SOFTMAX_TEMP     = float(_RA_CFG.get("softmax_temperature", 0.7))
+_SIDE_OVERLAP_MATCHER = FragmentMerger(load_ego_mask=False)
 
 # ---------------------------------------------------------------------------
 # G-Eval Evaluation Criteria
@@ -239,21 +242,21 @@ def build_agents_from_segments(
     agents      = []
     depth_range = depth_max - depth_min if depth_max > depth_min else 1.0
 
-    # Group segments by instance_id to merge across sides
-    instance_groups: dict[int, list[dict]] = {}
+    # Normalize nested inputs, then merge cross-side masks before creating agents.
+    normalized_segments = []
     for seg_entry in frame_segments:
-        if isinstance(seg_entry, list):
-            segs_to_process = seg_entry
-        else:
-            segs_to_process = [seg_entry]
+        segs_to_process = seg_entry if isinstance(seg_entry, list) else [seg_entry]
+        normalized_segments.extend(seg for seg in segs_to_process if isinstance(seg, dict))
 
-        for seg in segs_to_process:
-            if not isinstance(seg, dict):
-                continue
-            iid = seg.get("instance_id", -1)
-            if iid not in instance_groups:
-                instance_groups[iid] = []
-            instance_groups[iid].append(seg)
+    _SIDE_OVERLAP_MATCHER.merge_side_overlaps(normalized_segments)
+
+    # Group matching segments by instance_id so each physical agent appears once.
+    instance_groups: dict[int, list[dict]] = {}
+    for seg in normalized_segments:
+        iid = seg.get("instance_id", -1)
+        if iid not in instance_groups:
+            instance_groups[iid] = []
+        instance_groups[iid].append(seg)
 
     agents = []
     for iid, segs in instance_groups.items():
@@ -329,6 +332,7 @@ def _build_epoch_scene_block(
     agent_risks:     dict[str, float] = None,
     epoch_id:        str = "latest",
     exclude_ids:     list[str] = None,
+    include_multimodal: bool = True,
 ) -> tuple[str, list[dict]]:
     """
     Assembles a temporal scene context block across a sequence/batch of frames.
@@ -393,7 +397,7 @@ def _build_epoch_scene_block(
 
         # Depth trend and proximity danger
         min_depth = min(a.mode_depth for a in occurrences)
-        is_danger_zone = min_depth < 0.1
+        is_danger_zone = min_depth < CONFIG["risk_assessment"].get("danger_zone_threshold", 0.1)
 
         if len(occurrences) > 1:
             depth_delta = last.mode_depth - first.mode_depth
@@ -425,24 +429,22 @@ def _build_epoch_scene_block(
             f"Frames: {frames_active} | Avg Prox: {avg_prox:.0f}% | Trend: {trend}"
         )
 
-    # --- Multimodal Content ---
-    # Default: Try to generate one composite video for the whole epoch
-    try:
-        composite_video_b64 = _generate_epoch_composite_video(top_instance_ids, epoch_agents, frames)
-        if composite_video_b64:
-            multimodal_content.append({"type": "video", "content": composite_video_b64, "description": "Composite epoch view"})
-    except Exception as e:
-        logger.warning("Failed to generate composite video, falling back to per-agent videos: %s", e)
-        # Fallback: generate individual videos for each top physical agent
-        for iid in top_instance_ids:
-            # We use the representative's agent_id for the per-agent video
-            rep = all_physical_agents[iid]
-            try:
-                video_b64 = _generate_agent_bbox_video(rep.agent_id, epoch_agents, frames)
-                if video_b64:
-                    multimodal_content.append({"type": "video", "content": video_b64, "agent_id": rep.agent_id})
-            except Exception:
-                pass
+    if include_multimodal:
+        # Generate the composite once for the initial WM payload.
+        try:
+            composite_video_b64 = _generate_epoch_composite_video(top_instance_ids, epoch_agents, frames)
+            if composite_video_b64:
+                multimodal_content.append({"type": "video", "content": composite_video_b64, "description": "Composite epoch view"})
+        except Exception as e:
+            logger.warning("Failed to generate composite video, falling back to per-agent videos: %s", e)
+            for iid in top_instance_ids:
+                rep = all_physical_agents[iid]
+                try:
+                    video_b64 = _generate_agent_bbox_video(rep.agent_id, epoch_agents, frames)
+                    if video_b64:
+                        multimodal_content.append({"type": "video", "content": video_b64, "agent_id": rep.agent_id})
+                except Exception:
+                    pass
 
     # Build the final text block
     epoch_agents_block = "\n".join(track_summaries) if track_summaries else "  (no dynamic agents detected across epoch)"
@@ -468,26 +470,25 @@ def _build_epoch_scene_block(
         f"[Physical Telemetry]\n{telemetry_block}"
     )
 
-    # Debug: save the exact input prompt and multimodal summary sent to WM
-    try:
-        prompt_debug_path = DEBUG_WM_DIR / f"wm_prompt_{epoch_id}.md"
-        with open(prompt_debug_path, "w", encoding="utf-8") as f:
-            f.write(f"# World Model Input Prompt\n\n## Text Prompt\n\n{text}\n\n## Multimodal Content\n")
-            for i, item in enumerate(multimodal_content):
-                if item["type"] == "video":
-                    f.write(f"- Video {i}: {item.get('description', 'No description')} (ID: {item.get('agent_id', 'N/A')})\n")
-                    # Save a copy of the video to the debug directory
-                    video_filename = f"composite_{epoch_id}_{i}.mp4"
-                    with open(DEBUG_WM_DIR / video_filename, "wb") as vf:
-                        vf.write(base64.b64decode(item["content"]))
-                elif item["type"] == "image":
-                    f.write(f"- Image {i}: (ID: {item.get('agent_id', 'N/A')})\n")
-                    # Save a copy of the image to the debug directory
-                    image_filename = f"crop_{epoch_id}_{i}.jpg"
-                    with open(DEBUG_WM_DIR / image_filename, "wb") as ifile:
-                        ifile.write(base64.b64decode(item["content"]))
-    except Exception as e:
-        logger.warning("Failed to save debug prompt: %s", e)
+    if include_multimodal:
+        # Save the initial WM payload for inspection; sampling rebuilds only text.
+        try:
+            prompt_debug_path = DEBUG_WM_DIR / f"wm_prompt_{epoch_id}.md"
+            with open(prompt_debug_path, "w", encoding="utf-8") as f:
+                f.write(f"# World Model Input Prompt\n\n## Text Prompt\n\n{text}\n\n## Multimodal Content\n")
+                for i, item in enumerate(multimodal_content):
+                    if item["type"] == "video":
+                        f.write(f"- Video {i}: {item.get('description', 'No description')} (ID: {item.get('agent_id', 'N/A')})\n")
+                        video_filename = f"composite_{epoch_id}_{i}.mp4"
+                        with open(DEBUG_WM_DIR / video_filename, "wb") as vf:
+                            vf.write(base64.b64decode(item["content"]))
+                    elif item["type"] == "image":
+                        f.write(f"- Image {i}: (ID: {item.get('agent_id', 'N/A')})\n")
+                        image_filename = f"crop_{epoch_id}_{i}.jpg"
+                        with open(DEBUG_WM_DIR / image_filename, "wb") as ifile:
+                            ifile.write(base64.b64decode(item["content"]))
+        except Exception as e:
+            logger.warning("Failed to save debug prompt: %s", e)
 
     return text, multimodal_content
 
@@ -850,15 +851,6 @@ def _generate_epoch_composite_video(
     Caches the video and returns the base64 encoded video string.
     """
     VIDEO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    # Create a stable cache name based on top physical agent IDs
-    cache_key = "_".join(map(str, sorted(top_instance_ids)))
-    if len(cache_key) > 100: cache_key = cache_key[:100]
-    video_path = VIDEO_CACHE_DIR / f"composite_{cache_key}.mp4"
-
-    if video_path.exists():
-        with open(video_path, "rb") as f:
-            return base64.b64encode(f.read()).decode("utf-8")
-
     # Define the desired order of sides for the composite strip
     target_sides = ['left', 'front', 'right', 'back']
     # Only use sides that are actually present in the frames data
@@ -871,90 +863,112 @@ def _generate_epoch_composite_video(
     if not available_sides:
         return ""
 
+    overlap = max(0.0, float(CONFIG.get("processing", {}).get("side_overlap", 0.0)))
+    cache_digest = hashlib.sha256()
+    cache_digest.update(str((overlap, sorted(top_instance_ids))).encode())
+    for side in available_sides:
+        side_frames = frames[side] if isinstance(frames, dict) else frames
+        cache_digest.update(side.encode())
+        for image in side_frames:
+            cache_digest.update(np.ascontiguousarray(image).view(np.uint8))
+    for frame_idx, frame in enumerate(epoch_agents):
+        for agent in frame:
+            if agent.instance_id not in top_instance_ids:
+                continue
+            cache_digest.update(f"{frame_idx}:{agent.instance_id}".encode())
+            for side, mask in sorted(agent.masks.items()):
+                if mask is not None:
+                    cache_digest.update(side.encode())
+                    cache_digest.update(np.ascontiguousarray(mask, dtype=np.uint8).view(np.uint8))
+
+    cache_key = "_".join(map(str, sorted(top_instance_ids)))[:80] or "no_agents"
+    cache_key = f"{cache_key}_{cache_digest.hexdigest()[:16]}"
+    video_path = VIDEO_CACHE_DIR / f"composite_{cache_key}.mp4"
+    num_frames = len(epoch_agents)
+    if video_path.exists():
+        cached_video = cv2.VideoCapture(str(video_path))
+        cached_frame_count = int(cached_video.get(cv2.CAP_PROP_FRAME_COUNT)) if cached_video.isOpened() else 0
+        cached_video.release()
+        if cached_frame_count == num_frames:
+            with open(video_path, "rb") as f:
+                return base64.b64encode(f.read()).decode("utf-8")
+        video_path.unlink(missing_ok=True)
+
     video_frames = []
     # Iterate through the epoch frames
-    num_frames = len(epoch_agents)
     for f_idx in range(num_frames):
         # 1. Build the composite frame by stitching available sides
         side_imgs = []
-        for side in available_sides:
-            img = frames[side][f_idx] if isinstance(frames, dict) else frames[f_idx]
-            side_imgs.append(img)
-
-        composite_img = np.hstack(side_imgs)
-
-        # Calculate side widths for BBox offsets
-        side_widths = []
+        side_offsets = {}
+        side_margins = {}
         current_offset = 0
         for side in available_sides:
             img = frames[side][f_idx] if isinstance(frames, dict) else frames[f_idx]
-            w = img.shape[1]
-            side_widths.append((side, current_offset))
-            current_offset += w
+            margin = int((overlap / (2.0 + 2.0 * overlap)) * img.shape[1]) if overlap else 0
+            cropped_img = img[:, margin:img.shape[1] - margin] if margin else img
+            side_offsets[side] = current_offset
+            side_margins[side] = margin
+            side_imgs.append(cropped_img)
+            current_offset += cropped_img.shape[1]
 
-        side_offset_map = dict(side_widths)
+        composite_img = np.hstack(side_imgs).copy()
 
         # 2. Draw BBoxes for all top agents present in this frame
         placed_labels = []  # Track (x, y, w, h) of labels in this frame
         for agent in epoch_agents[f_idx]:
-            if agent.instance_id in top_instance_ids:
-                # Find the offset for this agent's side
-                for side in agent.fused_sides:
-                    if side in side_offset_map:
-                        offset_x = side_offset_map[side]
-                        mask = agent.masks.get(side)
-                        if mask is not None and np.any(mask):
-                            coords = np.argwhere(mask)
-                            y0, x0 = coords.min(axis=0)
-                            y1, x1 = coords.max(axis=0) + 1
+            if agent.instance_id not in top_instance_ids:
+                continue
 
-                            # Adjust X coordinates by the side offset
-                            abs_x0 = x0 + offset_x
-                            abs_x1 = x1 + offset_x
+            composite_mask = np.zeros(composite_img.shape[:2], dtype=bool)
+            for side in agent.fused_sides:
+                if side not in side_offsets:
+                    continue
+                mask = agent.masks.get(side)
+                if mask is None or not np.any(mask):
+                    continue
 
-                            # Draw BBox
-                            color = get_color_for_agent(agent.agent_id)
-                            cv2.rectangle(composite_img, (abs_x0, y0), (abs_x1, y1), color, 3)
+                margin = side_margins[side]
+                cropped_mask = mask[:, margin:mask.shape[1] - margin] if margin else mask
+                side_start = side_offsets[side]
+                side_end = min(side_start + cropped_mask.shape[1], composite_img.shape[1])
+                if side_end > side_start:
+                    composite_mask[:, side_start:side_end] |= cropped_mask[:, :side_end - side_start]
 
-                            # Label with background and overlap avoidance
-                            text = f"ID:{agent.agent_id}"
-                            font = cv2.FONT_HERSHEY_SIMPLEX
-                            font_scale = 0.5
-                            thickness = 1
-                            (tw, th), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+            if not np.any(composite_mask):
+                continue
 
-                            # Initial position
-                            label_x = abs_x0
-                            label_y = max(0, y0 - 10)
+            color = get_color_for_agent(agent.agent_id)
+            overlay = composite_img.copy()
+            overlay[composite_mask] = color
+            cv2.addWeighted(overlay, 0.5, composite_img, 0.5, 0, composite_img)
 
-                            # Simple overlap avoidance: shift label up if it overlaps an existing one
-                            # (only checking a few shifts for simplicity)
-                            for shift in range(0, 100, 20):
-                                label_rect = (label_x, label_y - th - baseline - shift, label_x + tw, label_y + baseline - shift)
-                                overlap = False
-                                for prev_rect in placed_labels:
-                                    # Check intersection of rectangles
-                                    if not (label_rect[2] <= prev_rect[0] or label_rect[0] >= prev_rect[2] or
-                                            label_rect[3] <= prev_rect[1] or label_rect[1] >= prev_rect[3]):
-                                        overlap = True
-                                        break
-                                if not overlap:
-                                    break
-                                label_y -= 20 # shift further up
+            coords = np.argwhere(composite_mask)
+            y0, x0 = coords.min(axis=0)
+            y1, x1 = coords.max(axis=0) + 1
+            cv2.rectangle(composite_img, (x0, y0), (x1, y1), color, 3)
 
-                            # Draw label background and text
-                            cv2.rectangle(composite_img, (label_x, label_y - th - baseline), (label_x + tw, label_y + baseline), color, -1)
-                            cv2.putText(composite_img, text, (label_x, label_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+            text = f"ID:{agent.agent_id}"
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.5
+            thickness = 1
+            (tw, th), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+            label_x = int(x0)
+            label_y = max(0, int(y0) - 10)
 
-                            # Store the final label position
-                            placed_labels.append((label_x, label_y - th - baseline, label_x + tw, label_y + baseline))
+            for shift in range(0, 100, 20):
+                label_rect = (label_x, label_y - th - baseline - shift, label_x + tw, label_y + baseline - shift)
+                overlaps_label = any(
+                    not (label_rect[2] <= prev[0] or label_rect[0] >= prev[2]
+                         or label_rect[3] <= prev[1] or label_rect[1] >= prev[3])
+                    for prev in placed_labels
+                )
+                if not overlaps_label:
+                    label_y -= shift
+                    break
 
-                        # Draw label background and text
-                        cv2.rectangle(composite_img, (label_x, label_y - th - baseline), (label_x + tw, label_y + baseline), color, -1)
-                        cv2.putText(composite_img, text, (label_x, label_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
-
-                        # Store the final label position
-                        placed_labels.append((label_x, label_y - th - baseline, label_x + tw, label_y + baseline))
+            cv2.rectangle(composite_img, (label_x, label_y - th - baseline), (label_x + tw, label_y + baseline), color, -1)
+            cv2.putText(composite_img, text, (label_x, label_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+            placed_labels.append((label_x, label_y - th - baseline, label_x + tw, label_y + baseline))
 
         video_frames.append(composite_img)
 
@@ -962,13 +976,43 @@ def _generate_epoch_composite_video(
         return ""
 
     # Save as video
-    h, w, _ = video_frames[0].shape
+    h, w = video_frames[0].shape[:2]
+    output_size = (w - w % 2, h - h % 2)
+    if output_size[0] < 2 or output_size[1] < 2:
+        raise ValueError(f"Invalid WM composite video dimensions: {w}x{h}")
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(str(video_path), fourcc, 10.0, (w, h))
-    for frame in video_frames:
-        bgr_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        out.write(bgr_frame)
-    out.release()
+    out = cv2.VideoWriter(str(video_path), fourcc, 10.0, output_size)
+    if not out.isOpened():
+        out.release()
+        video_path.unlink(missing_ok=True)
+        raise RuntimeError(f"Could not open WM composite video writer for {video_path} at {output_size}")
+    try:
+        for frame_idx, frame in enumerate(video_frames):
+            if frame.shape[:2] != (output_size[1], output_size[0]):
+                logger.warning(
+                    "Resizing WM composite frame %d from %sx%s to %sx%s",
+                    frame_idx,
+                    frame.shape[1],
+                    frame.shape[0],
+                    output_size[0],
+                    output_size[1],
+                )
+                frame = cv2.resize(frame, output_size, interpolation=cv2.INTER_AREA)
+            if frame.dtype != np.uint8:
+                frame = np.clip(frame, 0, 255).astype(np.uint8)
+            bgr_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            out.write(bgr_frame)
+    finally:
+        out.release()
+
+    written_video = cv2.VideoCapture(str(video_path))
+    written_frame_count = int(written_video.get(cv2.CAP_PROP_FRAME_COUNT)) if written_video.isOpened() else 0
+    written_video.release()
+    if written_frame_count != num_frames:
+        video_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"WM composite video is incomplete: wrote {written_frame_count} of {num_frames} frames"
+        )
 
     with open(video_path, "rb") as f:
         return base64.b64encode(f.read()).decode("utf-8")
@@ -1449,7 +1493,8 @@ def generate_hazard_viz_video(
 
                 # Draw sparkline
                 points = []
-                for f_idx_plot in range(f_idx + 1):
+                telemetry_samples = min(f_idx + 1, len(epoch_telemetry))
+                for f_idx_plot in range(telemetry_samples):
                     val = getattr(epoch_telemetry[f_idx_plot], m["key"], 0.0)
                     norm_val = (val - m["min"]) / (m["max"] - m["min"])
                     y = telemetry_bar_h - 10 - (norm_val * (telemetry_bar_h - 40))
@@ -1468,36 +1513,41 @@ def generate_hazard_viz_video(
             agent = next((a for a in frame_agents if a.agent_id == oid), None)
 
             if agent:
+                composite_mask = np.zeros((h, total_w), dtype=bool)
                 for side in agent.fused_sides:
-                    if side in side_offsets:
-                        offset_x = side_offsets[side]
-                        mask = agent.masks.get(side)
-                        if mask is not None and np.any(mask):
-                            # Mask Overlay
-                            overlay = composite_img.copy()
-                            full_mask = np.zeros((h, total_w), dtype=bool)
-                            full_mask[:, offset_x : offset_x + (mask[:, margin:w_single-margin].shape[1] if overlap > 0 else mask.shape[1])] = (mask[:, margin:w_single-margin] if overlap > 0 else mask)
+                    if side not in side_offsets:
+                        continue
+                    mask = agent.masks.get(side)
+                    if mask is None or not np.any(mask):
+                        continue
+                    cropped_mask = mask[:, margin:mask.shape[1] - margin] if margin else mask
+                    offset_x = side_offsets[side]
+                    end_x = min(offset_x + cropped_mask.shape[1], total_w)
+                    if end_x > offset_x:
+                        composite_mask[:, offset_x:end_x] |= cropped_mask[:, :end_x - offset_x]
 
-                            overlay[full_mask] = color
-                            cv2.addWeighted(overlay, 0.5, composite_img, 0.5, 0, composite_img)
+                if np.any(composite_mask):
+                    full_mask = np.zeros((total_h, total_w), dtype=bool)
+                    full_mask[telemetry_bar_h:telemetry_bar_h + h] = composite_mask
+                    overlay = composite_img.copy()
+                    overlay[full_mask] = color
+                    cv2.addWeighted(overlay, 0.5, composite_img, 0.5, 0, composite_img)
 
-                            # BBox and Label
-                            coords = np.argwhere(mask[:, margin:w_single-margin] if overlap > 0 else mask)
-                            y0, x0 = coords.min(axis=0)
-                            y1, x1 = coords.max(axis=0) + 1
+                    coords = np.argwhere(composite_mask)
+                    y0, x0 = coords.min(axis=0)
+                    y1, x1 = coords.max(axis=0) + 1
+                    y0 += telemetry_bar_h
+                    y1 += telemetry_bar_h
+                    cv2.rectangle(composite_img, (x0, y0), (x1, y1), color, 3)
+                    label = f"Hazard {rank+1}: {agent.class_name}"
 
-                            abs_x0, abs_x1 = x0 + offset_x, x1 + offset_x
-                            cv2.rectangle(composite_img, (abs_x0, y0), (abs_x1, y1), color, 3)
-                            label = f"Hazard {rank+1}: {agent.class_name}"
-
-                            # Label with background
-                            font = cv2.FONT_HERSHEY_SIMPLEX
-                            font_scale = 0.6
-                            thickness = 2
-                            (tw, th), baseline = cv2.getTextSize(label, font, font_scale, thickness)
-                            text_x, text_y = abs_x0, max(0, y0 - 10)
-                            cv2.rectangle(composite_img, (text_x, text_y - th - baseline), (text_x + tw, text_y + baseline), color, -1)
-                            cv2.putText(composite_img, label, (text_x, text_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+                    font = cv2.FONT_HERSHEY_SIMPLEX
+                    font_scale = 0.6
+                    thickness = 2
+                    (tw, th), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+                    text_x, text_y = x0, max(telemetry_bar_h, y0 - 10)
+                    cv2.rectangle(composite_img, (text_x, text_y - th - baseline), (text_x + tw, text_y + baseline), color, -1)
+                    cv2.putText(composite_img, label, (text_x, text_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
         # 3. Correct Color Format: RGB -> BGR for OpenCV VideoWriter
         final_frame = cv2.cvtColor(composite_img, cv2.COLOR_RGB2BGR)
@@ -1733,7 +1783,8 @@ class RiskAssessmentEngine:
                     telemetry       = context["telemetry"],
                     agent_risks     = context.get("agent_risks"),
                     epoch_id        = context.get("epoch_id", "latest"),
-                    exclude_ids     = extracted_ids
+                    exclude_ids     = extracted_ids,
+                    include_multimodal = False,
                 )
             else:
                 scene_block, current_multimodal = _build_scene_block(

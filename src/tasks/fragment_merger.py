@@ -10,9 +10,10 @@ class FragmentMerger:
     """
     Post-processing step to merge panoptic instance fragments split by ego-vehicle occluders.
     """
-    def __init__(self):
+    def __init__(self, load_ego_mask=True):
         self.cfg = CONFIG.get("fragment_merging", {})
-        if not self.cfg.get("enabled", True):
+        self._face_projection_cache = {}
+        if not load_ego_mask or not self.cfg.get("enabled", True):
             self.ego_mask = None
             return
 
@@ -59,6 +60,164 @@ class FragmentMerger:
         intersection = end - start
         union = (r1[1] - r1[0]) + (r2[1] - r2[0]) - intersection
         return intersection / union if union > 0 else 0.0
+
+    def _get_face_projection(self, side: str, height: int, width: int, overlap: float):
+        cache_key = (side, height, width, overlap)
+        if cache_key in self._face_projection_cache:
+            return self._face_projection_cache[cache_key]
+
+        u_axis = np.linspace(-1.0 - overlap, 1.0 + overlap, width)
+        if side in ("right", "left"):
+            u_axis = u_axis[::-1]
+        v_axis = np.linspace(1.0 + overlap, -1.0 - overlap, height)
+        uu, vv = np.meshgrid(u_axis, v_axis)
+
+        if side == "front":
+            theta = np.arctan2(uu, np.ones_like(uu))
+        elif side == "right":
+            theta = np.arctan2(np.ones_like(uu), uu)
+        elif side == "back":
+            theta = np.arctan2(-uu, -np.ones_like(uu))
+        elif side == "left":
+            theta = np.arctan2(-np.ones_like(uu), -uu)
+        else:
+            raise ValueError(f"Unknown cube side: {side}")
+
+        phi = np.arctan2(vv, np.sqrt(uu**2 + vv**2 + 1.0))
+        x = np.sin(theta) * np.cos(phi)
+        y = np.sin(phi)
+        z = np.cos(theta) * np.cos(phi)
+
+        pano_height = max(2 * height, 1)
+        pano_width = max(4 * width, 1)
+        longitude = (theta / (2.0 * np.pi) + 0.5) * pano_width
+        latitude = (np.pi / 2.0 - phi) / np.pi * pano_height
+        pano_x = np.rint(longitude).astype(np.int64) % pano_width
+        pano_y = np.clip(np.rint(latitude).astype(np.int64), 0, pano_height - 1)
+        projection = (
+            (pano_y * pano_width + pano_x).ravel(),
+            x.ravel(),
+            y.ravel(),
+            z.ravel(),
+        )
+        self._face_projection_cache[cache_key] = projection
+        return projection
+
+    @staticmethod
+    def _visible_on_side(x, y, z, side: str, overlap: float):
+        horizontal = np.sqrt(x**2 + z**2)
+        v = y / np.where(horizontal > 0, horizontal, 1.0)
+        if side == "front":
+            valid = z > 0
+            denom = np.where(valid, z, 1.0)
+            u = x / denom
+        elif side == "right":
+            valid = x > 0
+            denom = np.where(valid, x, 1.0)
+            u = z / denom
+        elif side == "back":
+            valid = z < 0
+            denom = np.where(valid, z, -1.0)
+            u = x / denom
+        elif side == "left":
+            valid = x < 0
+            denom = np.where(valid, x, -1.0)
+            u = z / denom
+        else:
+            return np.zeros_like(x, dtype=bool)
+
+        limit = 1.0 + overlap
+        return valid & (np.abs(u) <= limit) & (np.abs(v) <= limit)
+
+    def merge_side_overlaps(self, frame_segments: List[Dict[str, Any]], overlap: Optional[float] = None):
+        """Give same-class detections on different faces one shared instance ID."""
+        if len(frame_segments) < 2:
+            return frame_segments
+
+        processing_cfg = CONFIG.get("processing", {})
+        if overlap is None:
+            overlap = float(processing_cfg.get("side_overlap", 0.0))
+        if overlap <= 0:
+            return frame_segments
+
+        match_cfg = processing_cfg.get("side_overlap_matching", {})
+        min_coverage = float(match_cfg.get("min_coverage", 0.2))
+        min_pixels = int(match_cfg.get("min_pixels", 4))
+        mergeable_classes = set(self.cfg.get("mergeable_classes", []))
+        candidates = [
+            (index, segment)
+            for index, segment in enumerate(frame_segments)
+            if segment.get("class_name") in mergeable_classes
+            and segment.get("side") in ("front", "right", "back", "left")
+            and isinstance(segment.get("mask"), np.ndarray)
+        ]
+        if len(candidates) < 2:
+            return frame_segments
+
+        parent = list(range(len(candidates)))
+
+        def find(index):
+            while parent[index] != index:
+                parent[index] = parent[parent[index]]
+                index = parent[index]
+            return index
+
+        def union(left, right):
+            left_root, right_root = find(left), find(right)
+            if left_root != right_root:
+                parent[right_root] = left_root
+
+        projected_masks = []
+        for _, segment in candidates:
+            mask = np.asarray(segment["mask"], dtype=bool)
+            height, width = mask.shape
+            pano_indices, x, y, z = self._get_face_projection(
+                segment["side"], height, width, overlap
+            )
+            active = mask.ravel()
+            projected_masks.append((
+                segment["side"],
+                segment["class_name"],
+                pano_indices,
+                x,
+                y,
+                z,
+                active,
+            ))
+
+        for left in range(len(candidates)):
+            side_a, class_a, pano_a, x_a, y_a, z_a, active_a = projected_masks[left]
+            for right in range(left + 1, len(candidates)):
+                side_b, class_b, pano_b, x_b, y_b, z_b, active_b = projected_masks[right]
+                if side_a == side_b or class_a != class_b:
+                    continue
+
+                common_a = active_a & self._visible_on_side(x_a, y_a, z_a, side_b, overlap)
+                common_b = active_b & self._visible_on_side(x_b, y_b, z_b, side_a, overlap)
+                indices_a = np.unique(pano_a[common_a])
+                indices_b = np.unique(pano_b[common_b])
+                if min(indices_a.size, indices_b.size) < min_pixels:
+                    continue
+
+                shared_pixels = np.intersect1d(indices_a, indices_b, assume_unique=True).size
+                coverage = shared_pixels / min(indices_a.size, indices_b.size)
+                if coverage >= min_coverage:
+                    union(left, right)
+
+        groups = {}
+        for index in range(len(candidates)):
+            groups.setdefault(find(index), []).append(index)
+
+        for group in groups.values():
+            if len(group) < 2:
+                continue
+            group_segments = [candidates[index][1] for index in group]
+            shared_id = min(segment["instance_id"] for segment in group_segments)
+            for segment in group_segments:
+                segment["instance_id"] = shared_id
+                segment["was_fused"] = True
+
+        return frame_segments
 
     def merge_fragments(self, frame_segments: List[Dict[str, Any]], depth_map: np.ndarray, frame_width: int, frame_height: int) -> List[Dict[str, Any]]:
         """

@@ -213,9 +213,14 @@ class SegmentationPipeline:
             logger.info(f"File input detected: {input_path}. Telemetry disabled (no directory provided).")
             self.telemetry_processor = None
 
+        pipeline_cfg = CONFIG.get("pipeline", {})
+        self.split_enabled = pipeline_cfg.get("split_panorama", True)
+        self.enabled_views = pipeline_cfg.get("views", ["front", "back", "left", "right"])
+
+        actual_cubic = cubic if self.split_enabled else False
         self.video_loader = VideoLoader(video_path)
         print("DEBUG: VideoLoader initialized", flush=True)
-        self.video_processor = VideoProcessor(self.video_loader, cubic=cubic)
+        self.video_processor = VideoProcessor(self.video_loader, cubic=actual_cubic)
         print("DEBUG: VideoProcessor initialized", flush=True)
         self.fragment_merger = FragmentMerger()
         print("DEBUG: SegmentationPipeline.__init__ end", flush=True)
@@ -319,7 +324,7 @@ class SegmentationPipeline:
         environment_items = []
         for i in range (len(segmentation_masks["front"])): # looping through frames
             frame_segments = []
-            for key in segmentation_masks.keys():  # looping through sides
+            for key in [k for k in segmentation_masks.keys() if k in self.enabled_views]:  # looping through enabled sides
                 for segment_info in segmentation_masks[key][i]["segmentation_labels"]:  # loop through segmented items
                     # Retrieve human-readable class name from model's id2label mapping
                     class_name = CONFIG["segmentation"]["id2label"].get(str(segment_info["label_id"]), f"Class_{segment_info['label_id']}")
@@ -395,6 +400,9 @@ class SegmentationPipeline:
 
                     # Replace old segments with merged ones
                     segmented_items[i] = [s for s in segmented_items[i] if s["side"] != key] + merged
+
+        for i, frame_segments in enumerate(segmented_items):
+            segmented_items[i] = self.fragment_merger.merge_side_overlaps(frame_segments)
 
         segmented_items = self.prune_depth(segmented_items)
         print(f"DEBUG: After depth prune - Total frames with agents: {sum(1 for f in segmented_items if f)}")
@@ -452,7 +460,7 @@ class SegmentationPipeline:
         environment_items = []
         for i in range (len(segmentation_masks["front"])): # looping through frames
             frame_segments = []
-            for key in segmentation_masks.keys():  # looping through sides
+            for key in [k for k in segmentation_masks.keys() if k in self.enabled_views]:  # looping through enabled sides
                 for segment_info in segmentation_masks[key][i]["segmentation_labels"]:  # loop through segmented items
                     # Retrieve human-readable class name from model's id2label mapping
                     class_name = CONFIG["segmentation"]["id2label"].get(str(segment_info["label_id"]), f"Class_{segment_info['label_id']}")
@@ -528,6 +536,9 @@ class SegmentationPipeline:
 
                     # Replace old segments with merged ones
                     segmented_items[i] = [s for s in segmented_items[i] if s["side"] != key] + merged
+
+        for i, frame_segments in enumerate(segmented_items):
+            segmented_items[i] = self.fragment_merger.merge_side_overlaps(frame_segments)
 
         segmented_items = self.prune_depth(segmented_items)
         print(f"DEBUG: After depth prune - Total frames with agents: {sum(1 for f in segmented_items if f)}")

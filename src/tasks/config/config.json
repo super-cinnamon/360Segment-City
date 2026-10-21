@@ -54,11 +54,11 @@
             7
         ],
         "score_threshold": 0.8,
-        "depth_threshold": 0.7,
+        "depth_threshold": 0.25,
         "min_depth": {
-            "back": 0.09,
-            "front": 0.02,
-            "sides": 0.054
+            "back": 0.1,
+            "front": 0.01,
+            "sides": 0.04
         }
     },
     "vlm": {
@@ -78,7 +78,11 @@
         "use_imu_telemetry": true,
         "prune_similar_frames": false,
         "frame_similarity_threshold": 2.0,
-        "side_overlap": 0.05
+        "side_overlap": 0.08,
+        "side_overlap_matching": {
+            "min_coverage": 0.2,
+            "min_pixels": 4
+        }
     },
     "risk_assessment": {
         "api_base": "http://localhost:5015/v1",
