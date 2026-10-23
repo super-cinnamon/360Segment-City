@@ -1,0 +1,15 @@
+# DRAMA Benchmark Config Override
+pipeline:
+  split_panorama: false
+  views: ["front"]
+
+segmentation:
+  min_depth: 0.0  # Set to 0 to ensure very close objects are not filtered
+
+risk_assessment:
+  danger_zone_threshold: 0.0
+  # Use a specific model for the benchmark if needed
+  # model_name: "..."
+
+dataset:
+  root: "<SET_DRAMA_PATH_HERE>"

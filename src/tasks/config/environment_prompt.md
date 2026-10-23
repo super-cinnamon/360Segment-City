@@ -7,6 +7,8 @@ Analyze the image carefully and output your response ONLY as a single, valid JSO
 1. FLOW_DENSITY:
    - Evaluate the overall density of surrounding vehicle traffic in the visible roadway.
    - Allowed values: "free_flow" (clear road, minimal traffic), "moderate" (steady traffic, ample safe distance), "heavy" (dense traffic, slow-moving, minimal headway), "congested" (stop-and-go or gridlock).
+   - Assess surrounding traffic relative to the ego vehicle, not just the overall road. Identify nearby moving vehicles and road users, especially motorcycles, bicycles, scooters, and e-bikes. Note their count, visible relative position, proximity, and movement; do not infer details hidden by occlusion.
+   - Treat a two-wheeler moving close to the ego vehicle as a meaningful risk factor, even when overall traffic density is low.
 
 2. LANE_GEOMETRY_AND_MARKINGS:
    - Analyze the lanes present on the current roadway section.
@@ -48,7 +50,12 @@ Analyze the image carefully and output your response ONLY as a single, valid JSO
 8. ENVIRONMENT_RISK_SCORE:
    - Estimate the scene's immediate risk for the rider on a continuous scale from 0.0 to 1.0.
    - Use 0.0 for very low-risk, clear-road scenes and 1.0 for very high-risk scenes.
-   - Consider traffic density, pedestrians, crossings, traffic signals, road complexity, weather, visibility, and the presence and proximity of road actors (e.g., cars, two-wheelers, and pedestrians).
+   - Consider traffic density, nearby traffic interactions, pedestrians, crossings, traffic signals, road complexity, weather, visibility, and the presence and proximity of road actors (e.g., cars, motorcycles, bicycles, scooters, e-bikes, and pedestrians). Increase the score when moving traffic or a two-wheeler is close to the ego vehicle or may cross its path.
+
+9. NEARBY_ROAD_USERS:
+   - List visible nearby road users that may interact with the ego vehicle, including cars, trucks, buses, motorcycles, bicycles, scooters, e-bikes, and pedestrians.
+   - Include only road users visible in the provided frames. Use "near", "moderate", or "far" for proximity relative to the ego vehicle, and "moving", "stationary", or "unknown" for movement.
+   - Use an empty array when no nearby road users are visible.
 
 ---
 
@@ -70,6 +77,15 @@ Analyze the image carefully and output your response ONLY as a single, valid JSO
     "posted_speed_limit": integer or null,
     "warning_or_regulatory_signs": ["string"]
   },
+   "nearby_road_users": [
+      {
+         "type": "car | truck | bus | motorcycle | bicycle | scooter | e-bike | pedestrian | other",
+         "count": integer,
+         "relative_position": "string",
+         "proximity": "near | moderate | far",
+         "movement": "moving | stationary | unknown"
+      }
+   ],
   "weather_conditions": "clear_sunny | overcast_cloudy | rainy | foggy_hazy",
   "lighting_conditions": "daylight | dusk_dawn | night_well_lit | night_dark",
   "environment_risk_score": 0.0,

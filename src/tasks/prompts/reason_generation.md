@@ -5,6 +5,10 @@ IMPORTANT: Pay extreme attention to the [Agent Trajectories & Temporal Trends] s
 
 IMPORTANT: Prioritize agents located behind the ego-vehicle (Side: back). These agents often occupy blind spots and may be partially obstructed, making them extremely high-risk threats that the rider might not be aware of. Be particularly vigilant about closing agents in the rear.
 
+IMPORTANT: Give explicit attention to nearby two-wheelers, including motorcycles, motorbikes, bicycles, scooters, and e-bikes. Assess their proximity, direction of travel, closing movement, and potential path conflict with the ego vehicle. Their smaller profile and limited clearance can make close interactions harder to anticipate; ground every claim in the scene data.
+
+IMPORTANT: Assess lane filtering/splitting (also called interfiling): the ego vehicle or another two-wheeler may be moving between lanes, including between queued or slow-moving traffic. Also watch for cars or other road users straddling lane boundaries or moving between lanes. Identify concrete conflicts such as a narrow passing gap, encroachment, a sudden lane change, crossing trajectories, or insufficient clearance. Do not treat filtering alone as a hazard or infer intent that is not visible; explain the specific interaction and its immediate risk.
+
 STRICT DO NOT USE / NEGATIVE CONSTRAINTS:
 1. NEVER mention camera attributes, field of view, mounting position, or system capabilities (e.g., DO NOT say 'The rider has a 360 view', 'The camera detects...', 'Because of the lens...').
 2. NEVER use conversational filler, meta commentary, or chain-of-thought language such as 'Okay, let me think', 'The user wants me to...', 'I see', 'as an AI', or any sentence that is not a hazard observation.
@@ -17,6 +21,7 @@ STRICT DO NOT USE / NEGATIVE CONSTRAINTS:
 
 GROUNDING RULES FOR THE HAZARD:
 - observation: one concrete, physically grounded sentence describing what is visible or moving. Use terms like 'left-side sedan', 'wet metal seam', 'narrowing gap', 'approaching cyclist', or 'braking lead vehicle'. Mention specific high-risk details: if it is a child, if the agent is facing the road, or if turn signals are active. For agents in the rear (Side: back), explicitly mention if they are in a blind spot or partially obstructed. IMPORTANT: The ego-vehicle getting cut off is a very high risk situation, especially when the ego-rider intends to turn.
+- For two-wheeler interactions, explicitly identify the visible type and whether it is close, approaching, passing, or crossing the ego vehicle's path. For lane filtering/splitting/interfiling, state which road user is between or straddling lanes and describe the observed gap or conflict; do not assume a maneuver from position alone.
 - danger_reasoning: explain the mechanism in 2-3 detailed clauses: how it threatens the rider, why it matters now (e.g., 'child may dart into road', 'facing road suggests imminent entry'), and what specific action is needed. For rear hazards, explicitly explain the risk associated with the rider's lack of visibility or the agent's presence in a blind spot. Be explicit about vulnerability and unpredictable intent. Do not mention being an AI or discussing the prompt.
 - actionable_risk: give imperative defensive-driving guidance such as 'Reduce speed and hold the left edge' or 'Prepare a controlled swerve to the right'.
 - You must produce EXACTLY ONE most-significant hazard. If no grounded threat exists, return an empty array [].

@@ -601,6 +601,7 @@ class SegmentationPipeline:
             epoch_idx: Optional[int] = None,
             raw_start: Optional[int] = None,
             raw_end: Optional[int] = None,
+            force_process: bool = False,
     ) -> dict:
         """Run ROI gating, environment description generation, segmentation, and risk assessment for one window."""
         if roi_enabled is None:
@@ -629,7 +630,8 @@ class SegmentationPipeline:
             roi_enabled=roi_enabled,
             roi_threshold=roi_threshold,
         )
-        if not should_process:
+        roi_triggered = roi_enabled and should_process
+        if not should_process and not force_process:
             return {
                 "processed": False,
                 "environment_description": environment_description,
@@ -637,6 +639,7 @@ class SegmentationPipeline:
                 "environment_items": [],
                 "risk_result": None,
                 "reason": "skip_low_roi",
+                "roi_triggered": False,
             }
 
         segmented_items, environment_items, depth_masks = self.process_vision_for(
@@ -671,6 +674,7 @@ class SegmentationPipeline:
             "environment_items": environment_items,
             "risk_result": risk_result,
             "reason": "processed",
+            "roi_triggered": roi_triggered,
         }
 
     # * the full risk processing pipeline, using sliding window of 60 frames (assuming framerate of gopro is 60)

@@ -195,6 +195,8 @@ class DetectedAgent:
         "was_fused":  bool,
         "mask":       np.ndarray,   # binary boolean mask (H × W)
         "mode_depth": float,        # modal depth; LOWER = CLOSER = HIGHER RISK
+        "mode_flow":  tuple[float, float] | None,
+        "flow_description": str,
     }
 
     distance_weight
@@ -214,6 +216,8 @@ class DetectedAgent:
     fused_sides:     list[str] = field(default_factory=list)
     masks:           dict[str, np.ndarray] = field(default_factory=dict) # side -> mask
     was_fused:       bool = False
+    mode_flow:       Optional[tuple[float, float]] = None
+    flow_description: Optional[str] = None
 
 # ---------------------------------------------------------------------------
 # 2. Factory helpers
@@ -287,6 +291,8 @@ def build_agents_from_segments(
             fused_sides     = fused_sides,
             masks           = masks,
             was_fused       = len(fused_sides) > 1,
+            mode_flow       = best_seg.get("mode_flow"),
+            flow_description = best_seg.get("flow_description"),
         ))
 
     return agents
@@ -318,6 +324,38 @@ def compute_depth_bounds(segmented_items: list[list[dict]]) -> tuple[float, floa
     if not all_depths:
         return 0.0, 1.0
     return float(min(all_depths)), float(max(all_depths))
+
+
+def _track_trend(occurrences: list[DetectedAgent], is_danger_zone: bool) -> str:
+    """Prefer observed optical-flow direction; use depth change only when flow is unavailable."""
+    flow_descriptions = [
+        agent.flow_description
+        for agent in occurrences
+        if agent.flow_description and agent.flow_description != "no flow data"
+    ]
+
+    if flow_descriptions:
+        flow_description = max(flow_descriptions, key=flow_descriptions.count)
+        trend = f"FLOW: {flow_description}"
+    else:
+        flow_vectors = [agent.mode_flow for agent in occurrences if agent.mode_flow is not None]
+        if flow_vectors:
+            mean_flow = np.mean(np.asarray(flow_vectors, dtype=float), axis=0)
+            trend = f"FLOW: u={mean_flow[0]:.2f}, v={mean_flow[1]:.2f}"
+        elif len(occurrences) > 1:
+            depth_delta = occurrences[-1].mode_depth - occurrences[0].mode_depth
+            if depth_delta < -0.05:
+                trend = "APPROACHING / CLOSING IN"
+            elif depth_delta > 0.05:
+                trend = "RECEDING / MOVING AWAY"
+            else:
+                trend = "STATIONARY / CONSTANT DISTANCE"
+        else:
+            trend = "UNKNOWN FLOW"
+
+    if is_danger_zone:
+        trend += " (HIGHER DANGER)"
+    return trend
 
 
 # ---------------------------------------------------------------------------
@@ -398,23 +436,7 @@ def _build_epoch_scene_block(
         # Depth trend and proximity danger
         min_depth = min(a.mode_depth for a in occurrences)
         is_danger_zone = min_depth < CONFIG["risk_assessment"].get("danger_zone_threshold", 0.1)
-
-        if len(occurrences) > 1:
-            depth_delta = last.mode_depth - first.mode_depth
-            if depth_delta < -0.05:
-                trend = "APPROACHING / CLOSING IN (HIGHER DANGER)"
-            elif depth_delta > 0.05:
-                trend = "RECEDING / MOVING AWAY"
-                if is_danger_zone:
-                    trend += " (HIGHER DANGER)"
-            else:
-                trend = "STATIONARY / CONSTANT DISTANCE"
-                if is_danger_zone:
-                    trend += " (HIGHER DANGER)"
-        else:
-            trend = "UNKNOWN FLOW"
-            if is_danger_zone:
-                trend += " (HIGHER DANGER)"
+        trend = _track_trend(occurrences, is_danger_zone)
 
         # Proximity summary
         avg_prox = np.mean([a.distance_weight for a in occurrences]) * 100
@@ -610,6 +632,8 @@ def _build_reason_prompt(scene_block: str, already_extracted_hazards: list[str] 
             "You are an expert Defensive Driving AI for a two-wheeled vehicle (motorcycle/bicycle/e-bike). "
             "Your goal is to analyze a 1-second 360-degree video snippet, cross-reference it with the provided "
             "object list and distance metrics, and identify actionable dynamic hazards.\n\n"
+            "IMPORTANT: Give explicit attention to nearby two-wheelers, including motorcycles, motorbikes, bicycles, scooters, and e-bikes. Assess proximity, direction, closing movement, and potential path conflict with the ego vehicle. Ground every claim in the scene data.\n\n"
+            "Assess lane filtering/splitting (also called interfiling): the ego vehicle or another two-wheeler may move between lanes, including between queued traffic. Also watch for other road users straddling lane boundaries or moving between lanes. Identify concrete conflicts such as a narrow passing gap, encroachment, sudden lane changes, crossing trajectories, or insufficient clearance. Do not treat filtering alone as a hazard or infer unsupported intent.\n\n"
             "STRICT DO NOT USE / NEGATIVE CONSTRAINTS:\n"
             "1. NEVER mention camera attributes, field of view, mounting position, or system capabilities "
             "(e.g., DO NOT say 'The rider has a 360 view', 'The camera detects...', 'Because of the lens...').\n"
@@ -632,6 +656,7 @@ def _build_reason_prompt(scene_block: str, already_extracted_hazards: list[str] 
             "  'left-side sedan', 'wet metal seam', 'narrowing gap', 'approaching cyclist', or 'braking lead vehicle'.\n"
             "  Mention specific high-risk details: if it is a child, if the agent is facing the road, or if turn signals are active.\n"
             "  IMPORTANT: The ego-vehicle getting cut off is a very high risk situation, especially when the ego-rider intends to turn.\n"
+            "  For two-wheeler interactions, identify the visible type and whether it is close, approaching, passing, or crossing the ego vehicle's path. For lane filtering/splitting/interfiling, state which road user is between or straddling lanes and describe the observed gap or conflict; do not assume a maneuver from position alone.\n"
             "- danger_reasoning: explain the mechanism in 2-3 detailed clauses: how it threatens the rider, why it matters now "
             "  (e.g., 'child may dart into road', 'facing road suggests imminent entry'), and what specific action is needed. "
             "  Be explicit about vulnerability and unpredictable intent. Do not mention being an AI or discussing the prompt.\n"
@@ -660,7 +685,8 @@ def _build_reason_prompt(scene_block: str, already_extracted_hazards: list[str] 
             "7. Signage, Signals & Lane Context:\n"
             "   - Traffic Signals: Does a red light or stop sign create a high-risk zone for unexpected movements?\n"
             "   - Lane Geometry: Does the rider's position (e.g., riding on the edge) or the lane type (merging, narrowing) elevate risk?\n"
-            "   - Markings: Are solid markings being violated or are there restrictive lane boundaries?\n\n",
+            "   - Markings: Are solid markings being violated or are there restrictive lane boundaries?\n"
+            "   - Lane filtering/interfiling: Is the ego vehicle or another two-wheeler moving between lanes, or is another road user straddling/changing lanes? Evaluate actual clearance, relative speed, visibility, and path conflict rather than treating the maneuver alone as hazardous.\n\n"
             "=== SCENE DATA (EPOCH BATCH) ===\n"
             f"{scene_block}\n\n"
             "=== EVALUATION CRITERIA ===\n"
@@ -723,7 +749,8 @@ def _build_reason_scoring_prompt(scene_block: str, reason: tuple[str, float], re
         "   ego-rider intends to turn, should be treated as very high risk and push the score toward 4 or 5.\n"
         "6. Amplify Awareness & Signal Risk: Scenarios where a hazard is closing in while the rider appears unaware (e.g., from a blind spot), or where critical traffic signals (red lights/stop signs) or lane markings are being ignored, should strongly push the score toward 4 or 5.\n"
         "7. Prioritize Blind-Spot Risks: Hazards involving agents behind the ego-vehicle (Side: back), especially those partially obstructed, should be treated with extreme caution and strongly push the score toward 4 or 5, as they represent a critical lack of visibility for the rider.\n"
-        "8. Mapping Logic: A 'Severe Hazard' or 'Imminent Collision' is a Score 5. A 'Clear Road' or 'No Hazard' is a Score 1. Do not invert this logic.\n\n"
+        "8. Assess Two-Wheeler and Lane-Filtering Risks: Consider nearby motorcycles, motorbikes, bicycles, scooters, and e-bikes, including their proximity, closing movement, and path relative to the ego vehicle. Assess lane filtering/splitting/interfiling by the ego vehicle or another two-wheeler, and other road users straddling or moving between lanes. Raise severity when evidence shows tight clearance, encroachment, a crossing path, or a closing conflict; do not assign high risk solely because a two-wheeler is present or filtering is occurring.\n"
+        "9. Mapping Logic: A 'Severe Hazard' or 'Imminent Collision' is a Score 5. A 'Clear Road' or 'No Hazard' is a Score 1. Do not invert this logic.\n\n"
         "PROBABILITY DISTRIBUTION RULES:\n"
         "1. The values in `score_probs` must sum exactly to 1.0.\n"
         "2. Expected Value Calculation: The final risk score is computed as a weighted average. For this reason, the model will calculate an 'expected score' = Σ (score * probability). For example, a distribution of {'4': 0.8, '5': 0.2} results in an expected score of 4.2.\n"

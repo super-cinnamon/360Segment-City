@@ -30,6 +30,37 @@ ROI_KEYWORDS: list[tuple[str, float]] = [
     ("congestion", 0.7),
 ]
 
+TWO_WHEELER_TYPES = {"motorcycle", "motorbike", "bicycle", "bike", "scooter", "e-bike", "ebike"}
+
+
+def _parse_environment_description(description: Optional[str]) -> Optional[dict]:
+    if isinstance(description, dict):
+        parsed = description
+    elif isinstance(description, str):
+        try:
+            parsed = json.loads(description)
+        except (TypeError, ValueError):
+            return None
+    else:
+        return None
+
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _nearby_road_user_types(parsed: Optional[dict]) -> set[str]:
+    if not parsed:
+        return set()
+    road_users = parsed.get("nearby_road_users", [])
+    if not isinstance(road_users, list):
+        return set()
+
+    return {
+        _normalize_text(str(road_user.get("type", "")))
+        for road_user in road_users
+        if isinstance(road_user, dict)
+        and _normalize_text(str(road_user.get("proximity", ""))) == "near"
+    }
+
 
 def _normalize_text(text: Optional[str]) -> str:
     if not text:
@@ -89,6 +120,24 @@ def compute_roi_score(description: Optional[str]) -> Tuple[float, list[str]]:
             matched_keywords.append(keyword)
             keyword_score += weight
 
+    parsed_description = _parse_environment_description(description)
+    nearby_types = _nearby_road_user_types(parsed_description)
+    nearby_two_wheeler = bool(nearby_types & TWO_WHEELER_TYPES)
+    nearby_traffic = bool(nearby_types - {"pedestrian"})
+    flow_density = _normalize_text(str((parsed_description or {}).get("flow_density", "")))
+    high_traffic_density = flow_density in {"heavy", "congested"}
+
+    if nearby_two_wheeler:
+        matched_keywords.append("nearby two-wheeler")
+        keyword_score = max(keyword_score, 3.0)
+    elif nearby_traffic:
+        matched_keywords.append("nearby traffic")
+        keyword_score = max(keyword_score, 3.0)
+
+    if high_traffic_density:
+        matched_keywords.append(flow_density)
+        keyword_score = max(keyword_score, 3.0)
+
     normalized_keyword_score = min(1.0, keyword_score / 4.0)
 
     parsed_score = _extract_environment_risk_score(description)
@@ -96,6 +145,8 @@ def compute_roi_score(description: Optional[str]) -> Tuple[float, list[str]]:
         if parsed_score > 1.0:
             parsed_score = min(1.0, parsed_score / 5.0)
         parsed_score = min(1.0, max(0.0, parsed_score))
+        if nearby_traffic or high_traffic_density:
+            parsed_score = max(parsed_score, 0.75)
         blended_score = min(1.0, 0.7 * parsed_score + 0.3 * normalized_keyword_score)
         combined_score = round(max(parsed_score, blended_score), 4)
 

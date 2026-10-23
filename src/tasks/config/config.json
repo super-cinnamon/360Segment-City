@@ -62,11 +62,11 @@
             7
         ],
         "score_threshold": 0.8,
-        "depth_threshold": 0.25,
+        "depth_threshold": 0.3,
         "min_depth": {
             "back": 0.1,
             "front": 0.01,
-            "sides": 0.04
+            "sides": 0.05
         }
     },
     "vlm": {
