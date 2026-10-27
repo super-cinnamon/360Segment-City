@@ -4,13 +4,19 @@ class ObjectIDTracker:
     """
     Tracks object IDs across frames within an epoch using mask IoU and labels.
     """
-    def __init__(self, iou_threshold=0.5, max_missing_frames=5):
-        self.cache = {}  # id -> {mask, label, last_frame}
+    def __init__(self, iou_threshold=0.5, max_missing_frames=30):
+        self.cache = {}  # id -> {mask, label, side, last_frame}
         self.next_id = 0
         self.iou_threshold = iou_threshold
         self.max_missing_frames = max_missing_frames
+        self._assigned_frame = None
+        self._assigned_ids = set()
 
-    def get_id(self, current_mask, label, frame_idx):
+    def get_id(self, current_mask, label, frame_idx, side=None):
+        if frame_idx != self._assigned_frame:
+            self._assigned_frame = frame_idx
+            self._assigned_ids.clear()
+
         best_id = None
         max_iou = 0
 
@@ -18,7 +24,9 @@ class ObjectIDTracker:
         self._cleanup_cache(frame_idx)
 
         for obj_id, data in self.cache.items():
-            if data['label'] == label:
+            if obj_id in self._assigned_ids:
+                continue
+            if data['label'] == label and data.get('side') == side:
                 iou = self.calculate_iou(current_mask, data['mask'])
                 if iou > max_iou:
                     max_iou = iou
@@ -26,13 +34,25 @@ class ObjectIDTracker:
 
         if best_id is not None and max_iou >= self.iou_threshold:
             # Update cache with new position/mask
-            self.cache[best_id] = {"mask": current_mask, "label": label, "last_frame": frame_idx}
+            self.cache[best_id] = {
+                "mask": current_mask,
+                "label": label,
+                "side": side,
+                "last_frame": frame_idx,
+            }
+            self._assigned_ids.add(best_id)
             return best_id
         else:
             # Create new ID
             new_id = self.next_id
-            self.cache[new_id] = {"mask": current_mask, "label": label, "last_frame": frame_idx}
+            self.cache[new_id] = {
+                "mask": current_mask,
+                "label": label,
+                "side": side,
+                "last_frame": frame_idx,
+            }
             self.next_id += 1
+            self._assigned_ids.add(new_id)
             return new_id
 
     def _cleanup_cache(self, current_frame):

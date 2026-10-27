@@ -5,6 +5,7 @@ from typing import Optional, Union
 import os
 import pickle
 from pathlib import Path
+import numpy as np
 from src.tasks.preprocessing import (
     load_cubic,
     split_frames,
@@ -42,6 +43,7 @@ from src.tasks.roi import (
 from src.telemetry import TelemetryProcessor
 from src.tasks.config.utils import CONFIG, ENV_PROMPT, render_environment_prompt
 from src.tasks.fragment_merger import FragmentMerger
+from src.tasks.agent_persistence import RecentAgentHistory, restore_persistent_depth_pruned_agents
 
 class VideoLoader:
     def __init__(self, video_path):
@@ -85,7 +87,12 @@ class VideoProcessor:
     def __init__(self, video_loader: VideoLoader, cubic):
         self.video_loader = video_loader
         self.cubic = cubic
-        self.id_tracker = ObjectIDTracker() # Persist tracker across frames in epoch
+        self.id_tracker = ObjectIDTracker(
+            max_missing_frames=int(
+                CONFIG.get("agent_persistence", {}).get("max_age_frames", 30)
+            )
+        )
+        self.next_frame_index = 0
         from src.tasks.panorama_tracker import PanoramaTracker
         self.panorama_tracker = PanoramaTracker()
         if cubic:
@@ -225,6 +232,10 @@ class SegmentationPipeline:
         self.video_loader = VideoLoader(video_path)
         print("DEBUG: VideoLoader initialized", flush=True)
         self.video_processor = VideoProcessor(self.video_loader, cubic=actual_cubic)
+        history_cfg = CONFIG.get("agent_persistence", {})
+        self.recent_agent_history = RecentAgentHistory(
+            max_age_frames=history_cfg.get("max_age_frames", 30)
+        )
         print("DEBUG: VideoProcessor initialized", flush=True)
         self.fragment_merger = FragmentMerger()
         print("DEBUG: SegmentationPipeline.__init__ end", flush=True)
@@ -259,6 +270,39 @@ class SegmentationPipeline:
             }
         return resize_frames(frames, scale=scale)
 
+    def _get_absolute_frame_numbers(self, frame_count: int, raw_start=None) -> list[int]:
+        start = (
+            int(raw_start)
+            if raw_start is not None
+            else self.video_processor.next_frame_index
+        )
+        frame_numbers = list(range(start, start + frame_count))
+        self.video_processor.next_frame_index = max(
+            self.video_processor.next_frame_index, start + frame_count
+        )
+        return frame_numbers
+
+    def _attach_recent_history(self, frame_segments, frame_number: int) -> None:
+        history_cfg = CONFIG.get("agent_persistence", {})
+        score_floor = float(history_cfg.get("score_floor", 0.2))
+        score_threshold = float(CONFIG["segmentation"]["score_threshold"])
+        for segment in frame_segments:
+            history = self.recent_agent_history.match(
+                segment, frame_number, score_floor
+            )
+            if history is None:
+                continue
+            segment["recent_history"] = history
+            if segment.get("score", 0.0) < score_threshold:
+                segment["history_rescued"] = True
+
+    def _update_recent_history(self, segmented_items, frame_numbers) -> None:
+        score_threshold = float(CONFIG["segmentation"]["score_threshold"])
+        for frame_number, frame_segments in zip(frame_numbers, segmented_items):
+            self.recent_agent_history.observe_strong_segments(
+                frame_segments, frame_number, score_threshold
+            )
+
     def prune_segmentation(
             self,
             items,
@@ -274,8 +318,12 @@ class SegmentationPipeline:
         """
 
         items = [
-            item for item in items 
-            if item["score"] >= score_threshold and item["class_id"] in dynamic_labels
+            item for item in items
+            if item["class_id"] in dynamic_labels
+            and (
+                (item.get("score") is not None and item["score"] >= score_threshold)
+                or item.get("history_rescued", False)
+            )
         ]
 
         static_items = [item for item in items if item["class_id"] in static_labels]
@@ -307,7 +355,9 @@ class SegmentationPipeline:
         if self.video_loader.frames is None:
             self.video_loader.frames = self.video_loader.get_split_frames()
 
-        prepared_frames = self._prepare_frames_for_inference(self.video_loader.frames, image_scale=image_scale)
+        frames = self.video_loader.frames
+        frame_numbers = self._get_absolute_frame_numbers(len(frames))
+        prepared_frames = self._prepare_frames_for_inference(frames, image_scale=image_scale)
         depth_masks = self.video_processor.get_depth_mask_for(prepared_frames)
         segmentation_masks = self.video_processor.segment_for(prepared_frames, object_name)
         flow_masks = self.video_processor.get_flow_masks_for(prepared_frames)
@@ -335,7 +385,9 @@ class SegmentationPipeline:
                     binary_mask = (segmentation_masks[key][i]["segmentation_map"] == segment_info["id"])
 
                     # Keep IDs consistent across frames using Mask-Matching Cache
-                    consistent_id = self.video_processor.id_tracker.get_id(binary_mask, class_name, i)
+                    consistent_id = self.video_processor.id_tracker.get_id(
+                        binary_mask, class_name, frame_numbers[i], side=key
+                    )
 
                     # PANORAMA TRACKING: Link segmentation mask to global track ID if available
                     global_track_id = None
@@ -363,6 +415,7 @@ class SegmentationPipeline:
                         "class_name": class_name,
                         "class_id": segment_info["label_id"],
                         "instance_id": final_id,
+                        "agent_identity": f"mask:{key}:{class_name}:{consistent_id}",
                         "score": segment_info.get("score", None),
                         "was_fused": segment_info.get("was_fused", False),
                         "mask": binary_mask,
@@ -371,6 +424,7 @@ class SegmentationPipeline:
                         "flow_description": describe_flow(mode_flow_value, side=key),
                     })
             # prune segmentation items based on score and relevant labels
+            self._attach_recent_history(frame_segments, frame_numbers[i])
             frame_segments, environment_segments = self.prune_segmentation(frame_segments)
             print(f"DEBUG: Frame {i} - After score prune: {len(frame_segments)} agents")
             segmented_items.append(frame_segments)
@@ -408,7 +462,14 @@ class SegmentationPipeline:
         for i, frame_segments in enumerate(segmented_items):
             segmented_items[i] = self.fragment_merger.merge_side_overlaps(frame_segments)
 
+        candidates_by_frame = [list(frame_segments) for frame_segments in segmented_items]
         segmented_items = self.prune_depth(segmented_items)
+        depth_kept_segments = [list(frame_segments) for frame_segments in segmented_items]
+        segmented_items = restore_persistent_depth_pruned_agents(
+            candidates_by_frame,
+            segmented_items,
+        )
+        self._update_recent_history(depth_kept_segments, frame_numbers)
         print(f"DEBUG: After depth prune - Total frames with agents: {sum(1 for f in segmented_items if f)}")
         environment_items = self.prune_depth(environment_items)
 
@@ -422,6 +483,8 @@ class SegmentationPipeline:
         """
         if prepared_frames is None:
             prepared_frames = self._prepare_frames_for_inference(frames, image_scale=image_scale)
+        frame_count = len(frames["front"]) if isinstance(frames, dict) else len(frames)
+        frame_numbers = self._get_absolute_frame_numbers(frame_count, raw_start)
 
         # compute depth masks and segmentation masks for provided frames
         if self.video_processor.cubic:
@@ -471,7 +534,9 @@ class SegmentationPipeline:
                     binary_mask = (segmentation_masks[key][i]["segmentation_map"] == segment_info["id"])
 
                     # Keep IDs consistent across frames using Mask-Matching Cache
-                    consistent_id = self.video_processor.id_tracker.get_id(binary_mask, class_name, i)
+                    consistent_id = self.video_processor.id_tracker.get_id(
+                        binary_mask, class_name, frame_numbers[i], side=key
+                    )
 
                     # PANORAMA TRACKING: Link segmentation mask to global track ID if available
                     global_track_id = None
@@ -499,6 +564,7 @@ class SegmentationPipeline:
                         "class_name": class_name,
                         "class_id": segment_info["label_id"],
                         "instance_id": final_id,
+                        "agent_identity": f"mask:{key}:{class_name}:{consistent_id}",
                         "score": segment_info.get("score", None),
                         "was_fused": segment_info.get("was_fused", False),
                         "mask": binary_mask,
@@ -507,6 +573,7 @@ class SegmentationPipeline:
                         "flow_description": describe_flow(mode_flow_value, side=key),
                     })
             # prune segmentation items based on score and relevant labels
+            self._attach_recent_history(frame_segments, frame_numbers[i])
             frame_segments, environment_segments = self.prune_segmentation(frame_segments)
             print(f"DEBUG: Frame {i} - After score prune: {len(frame_segments)} agents")
             segmented_items.append(frame_segments)
@@ -544,7 +611,14 @@ class SegmentationPipeline:
         for i, frame_segments in enumerate(segmented_items):
             segmented_items[i] = self.fragment_merger.merge_side_overlaps(frame_segments)
 
+        candidates_by_frame = [list(frame_segments) for frame_segments in segmented_items]
         segmented_items = self.prune_depth(segmented_items)
+        depth_kept_segments = [list(frame_segments) for frame_segments in segmented_items]
+        segmented_items = restore_persistent_depth_pruned_agents(
+            candidates_by_frame,
+            segmented_items,
+        )
+        self._update_recent_history(depth_kept_segments, frame_numbers)
         print(f"DEBUG: After depth prune - Total frames with agents: {sum(1 for f in segmented_items if f)}")
         environment_items = self.prune_depth(environment_items)
 
@@ -583,7 +657,7 @@ class SegmentationPipeline:
         # This provides a comprehensive environment description for ROI gating.
         env_description = query_world_model(
             prompt=resolved_prompt,
-            images=front_frames,
+            video_frames=front_frames,
             model=CONFIG["vlm"]["world_model"]["model_name"],
         )
 
@@ -602,6 +676,7 @@ class SegmentationPipeline:
             raw_start: Optional[int] = None,
             raw_end: Optional[int] = None,
             force_process: bool = False,
+            viz_output_dir: Optional[str] = None,
     ) -> dict:
         """Run ROI gating, environment description generation, segmentation, and risk assessment for one window."""
         if roi_enabled is None:
@@ -665,6 +740,8 @@ class SegmentationPipeline:
             depth_masks=depth_masks,
             telemetry=telemetry,
             epoch_idx=epoch_idx,
+            raw_start_frame=raw_start or 0,
+            viz_output_dir=viz_output_dir,
         )
 
         return {
@@ -688,6 +765,8 @@ class SegmentationPipeline:
             api_base: str = CONFIG["risk_assessment"]["api_base"],
             model_name: str = CONFIG["risk_assessment"]["model_name"],
             epoch_idx: Optional[int] = None,
+            raw_start_frame: int = 0,
+            viz_output_dir: Optional[str] = None,
         ) -> Union[list[dict], dict]:
             """
             Runs G-VEval risk assessment across the batch of frames as an "epoch" window.
@@ -752,13 +831,19 @@ class SegmentationPipeline:
                             for _, row in epoch_df.iterrows()
                         ]
 
-                viz_path = f"outputs/risk_viz/hazard_viz_{epoch_idx}.mp4" if epoch_idx is not None else f"outputs/risk_viz/hazard_viz_{os.getpid()}.mp4"
+                viz_dir = Path(viz_output_dir or "outputs/risk_viz")
+                viz_path = str(viz_dir / (
+                    f"hazard_viz_{epoch_idx}.mp4"
+                    if epoch_idx is not None
+                    else f"hazard_viz_{os.getpid()}.mp4"
+                ))
                 generate_hazard_viz_video(
                     output_path=viz_path,
                     frames=frames,
                     epoch_agents=epoch_agents,
                     reasons_detail=risk_result.get("reasons", []),
                     epoch_telemetry=epoch_telemetry,
+                    raw_start_frame=raw_start_frame,
                 )
                 risk_result["viz_video_path"] = viz_path
             except Exception as e:

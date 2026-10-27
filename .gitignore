@@ -211,4 +211,7 @@ data/
 outputs/
 output/
 viz_results/
-tests/ 
+tests/
+!tests/
+tests/*
+!tests/test_agent_persistence.py

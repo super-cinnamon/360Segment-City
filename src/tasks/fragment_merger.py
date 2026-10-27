@@ -185,9 +185,12 @@ class FragmentMerger:
             if len(group) < 2:
                 continue
             group_segments = [candidates[index][1] for index in group]
-            shared_id = min(segment["instance_id"] for segment in group_segments)
+            shared_segment = min(group_segments, key=lambda segment: segment["instance_id"])
+            shared_id = shared_segment["instance_id"]
             for segment in group_segments:
                 segment["instance_id"] = shared_id
+                if "agent_identity" in shared_segment:
+                    segment["agent_identity"] = shared_segment["agent_identity"]
                 segment["was_fused"] = True
 
         return frame_segments
@@ -357,6 +360,7 @@ class FragmentMerger:
                     "class_name": candidates[0]["class_name"],
                     "class_id": candidates[0]["class_id"],
                     "instance_id": candidates[largest_idx]["instance_id"],
+                    "agent_identity": candidates[largest_idx].get("agent_identity"),
                     "score": weighted_conf / total_area if total_area > 0 else 0.6,
                     "was_fused": True,
                     "mask": union_mask,

@@ -69,6 +69,10 @@
             "sides": 0.05
         }
     },
+    "agent_persistence": {
+        "max_age_frames": 30,
+        "score_floor": 0.2
+    },
     "vlm": {
         "ollama": {
             "model_name": "gemma4:e2b",
@@ -96,7 +100,7 @@
         "api_base": "http://localhost:5015/v1",
         "model_name": "nvidia/Cosmos3-Nano",
         "epoch_window_size": 30,
-        "n_reasons": 4,
+        "n_reasons": 10,
         "normalize_scores": true,
         "risk_scoring_temperature": 0.5,
         "softmax_temperature": 0.7

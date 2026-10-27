@@ -371,6 +371,7 @@ def _build_epoch_scene_block(
     epoch_id:        str = "latest",
     exclude_ids:     list[str] = None,
     include_multimodal: bool = True,
+    recent_track_context: dict[str, dict] = None,
 ) -> tuple[str, list[dict]]:
     """
     Assembles a temporal scene context block across a sequence/batch of frames.
@@ -471,11 +472,46 @@ def _build_epoch_scene_block(
     # Build the final text block
     epoch_agents_block = "\n".join(track_summaries) if track_summaries else "  (no dynamic agents detected across epoch)"
 
+    recent_context_lines = []
+    for iid in top_instance_ids:
+        agent = all_physical_agents[iid]
+        context = (recent_track_context or {}).get(agent.agent_id)
+        if not context or agent.agent_id in exclude_ids:
+            continue
+
+        history = context["history"]
+        current_status = (
+            "current low-confidence observation retained using this track match"
+            if context.get("history_rescued")
+            else "current observation matches this recent track"
+        )
+        recent_context_lines.append(
+            f"    - ID: {agent.agent_id} | {agent.class_name} | Side: {agent.side} | "
+            f"{current_status}; last strong observation at frame "
+            f"{history['last_strong_frame']} (score {history['last_strong_score']:.2f}, "
+            f"depth {history['last_depth']:.3f}), "
+            f"{history['age_frames']} frames before the matched current observation "
+            f"at frame {history['matched_frame']}."
+        )
+    recent_context_block = (
+        "\n".join(recent_context_lines)
+        if recent_context_lines
+        else "  (no current agents matched to recent strong observations)"
+    )
+
     sides_present = sorted(set(a.side for a in [a for f in epoch_agents for a in f]))
+    if isinstance(frames, dict):
+        video_layout = "left-to-right panels: " + ", ".join(
+            side for side in ("left", "front", "right", "back") if side in frames
+        )
+    elif frames is not None:
+        video_layout = "single front view"
+    else:
+        video_layout = "video frames unavailable"
 
     if telemetry is not None:
         telemetry_block = (
-            f"  TTC={telemetry.ttc:.2f}s  |  PET={telemetry.pet:.2f}s  |  "
+            # f"  TTC={telemetry.ttc:.2f}s  |  PET={telemetry.pet:.2f}s  |  "
             f"Speed={telemetry.speed_kmh:.1f} km/h  |  v_rel={telemetry.v_rel:.1f} m/s  |  "
             f"d_lat={telemetry.d_lat:.1f} m  |  "
             f"roll={telemetry.roll:.1f}°  |  yaw_rate={telemetry.yaw_rate:.1f} °/s"
@@ -486,9 +522,12 @@ def _build_epoch_scene_block(
     text = (
         f"[Epoch Temporal Context]\n"
         f"Sliding Window / Epoch Batch: {total_frames} frames  |  Camera sides observed: {', '.join(sides_present) or 'none'}\n\n"
+        f"[Attached Video Layout]\n{video_layout}\n\n"
         f"[Environment]\n{env_description}\n\n"
         f"[Agent Trajectories & Temporal Trends across Epoch]\n"
         f"{epoch_agents_block}\n\n"
+        f"[Recent Track Context — historical, not current]\n"
+        f"{recent_context_block}\n\n"
         f"[Physical Telemetry]\n{telemetry_block}"
     )
 
@@ -583,7 +622,7 @@ def _build_scene_block(
 
     if telemetry is not None:
         telemetry_block = (
-            f"  TTC={telemetry.ttc:.2f}s  |  PET={telemetry.pet:.2f}s  |  "
+            # f"  TTC={telemetry.ttc:.2f}s  |  PET={telemetry.pet:.2f}s  |  "
             f"Speed={telemetry.speed_kmh:.1f} km/h  |  v_rel={telemetry.v_rel:.1f} m/s  |  "
             f"d_lat={telemetry.d_lat:.1f} m  |  "
             f"roll={telemetry.roll:.1f}°  |  yaw_rate={telemetry.yaw_rate:.1f} °/s"
@@ -632,6 +671,9 @@ def _build_reason_prompt(scene_block: str, already_extracted_hazards: list[str] 
             "You are an expert Defensive Driving AI for a two-wheeled vehicle (motorcycle/bicycle/e-bike). "
             "Your goal is to analyze a 1-second 360-degree video snippet, cross-reference it with the provided "
             "object list and distance metrics, and identify actionable dynamic hazards.\n\n"
+            "VISUAL EVIDENCE IS PRIMARY: Inspect the attached video frames directly to verify each hazard and visible motion. Bounding-box labels are exact agent IDs; use them to match a visible road user to the ID in the scene data. Treat textual descriptions and measurements as supporting evidence, not a substitute for inspecting the video.\n\n"
+            "EGO-OBJECT AND DETECTION-NOISE EXCLUSION (HARD RULE): Inspect the highlighted box in the video before selecting an ID. Never select the ego rider or camera-carrying vehicle, including the rider's body, clothing, helmet, arms, hands, legs, handlebars, mirrors, windscreen, or motorcycle bodywork. A separate road user on another motorcycle may be considered. Ignore boxes on ego parts, background texture, or no coherent independent object, regardless of class, depth, proximity, or trajectory text. If video does not clearly confirm an independent object and concrete hazard mechanism, return no hazard for it.\n\n"
+            "Any [Recent Track Context] is historical evidence only. Use it to assess continuity for an agent observed now; do not claim historical position, depth, or motion as current, and do not create a hazard from history alone.\n\n"
             "IMPORTANT: Give explicit attention to nearby two-wheelers, including motorcycles, motorbikes, bicycles, scooters, and e-bikes. Assess proximity, direction, closing movement, and potential path conflict with the ego vehicle. Ground every claim in the scene data.\n\n"
             "Assess lane filtering/splitting (also called interfiling): the ego vehicle or another two-wheeler may move between lanes, including between queued traffic. Also watch for other road users straddling lane boundaries or moving between lanes. Identify concrete conflicts such as a narrow passing gap, encroachment, sudden lane changes, crossing trajectories, or insufficient clearance. Do not treat filtering alone as a hazard or infer unsupported intent.\n\n"
             "STRICT DO NOT USE / NEGATIVE CONSTRAINTS:\n"
@@ -730,6 +772,8 @@ def _build_reason_scoring_prompt(scene_block: str, reason: tuple[str, float], re
         f"{scene_block}\n\n"
         "=== HAZARD INTERPRETATION TO SCORE ===\n"
         f"Interpretation {reason_index + 1} (Confidence: {probability:.2%}):\n{human}\n\n"
+        "VISUAL EVIDENCE: Inspect the attached visual evidence and verify the specific hazard against it. For an agent hazard, the highlighted box and visible ID identify only the agent being scored; do not use another agent's box as evidence for this interpretation. Scene descriptions and measurements are supporting evidence, not a replacement for visual verification.\n\n"
+        "EGO-OBJECT CHECK: Confirm from the attached video that the highlighted object is separate from the ego rider and camera-carrying motorcycle/scooter. If it is the rider, rider clothing/body, hands/arms/legs, helmet, handlebars, mirrors, windscreen, or ego vehicle bodywork, it is not a hazard; score this interpretation as minimal risk. If the box is noise or does not align with a coherent independent object, score it as a false positive with minimal risk. Do not treat agent-list text as proof that the object is real.\n\n"
         "=== RIGID RUBRIC (Use this to determine the score) ===\n"
         "1 = MINIMAL RISK  — Clear road; all agents distant; no action required.\n"
         "2 = LOW RISK      — Light traffic nearby; standard defensive riding applies.\n"
@@ -742,6 +786,8 @@ def _build_reason_scoring_prompt(scene_block: str, reason: tuple[str, float], re
         "JUDGING RULES:\n"
         "1. Be critical: if the hazard description implies an immediate threat, do not default to 3. Use 4 or 5.\n"
         "2. Be grounded: if the scene data contradicts the interpretation, score it lower.\n"
+        "   Recent track context is historical evidence only: use it to judge whether a current observation matches a prior track, not as proof of current position or threat.\n"
+        "   It is acceptable to flag a plausible hazard that may be a false positive; score that specific hazard low when evidence is weak or contradictory instead of omitting it. Correct per-hazard scoring is more important than optimizing the aggregate scene score.\n"
         "3. Differentiate: avoid assigning a 'neutral' 3 if the evidence strongly points to a specific rubric level.\n"
         "4. Amplify Vulnerability: Scenarios involving children, pedestrians/cyclists in close proximity, or "
         "   unpredictable intent (e.g., facing the road without moving) should strongly push the score toward 4 or 5.\n"
@@ -833,6 +879,75 @@ def _correct_object_id(returned_id: str, valid_ids: list[str], id_to_class: dict
     # Fallback: return "unknown" if no match found
     return "unknown"
 
+def _draw_agent_label(
+    image: np.ndarray,
+    bbox: tuple[int, int, int, int],
+    agent_id: str,
+    color: tuple[int, int, int],
+    occupied_labels: Optional[list[tuple[int, int, int, int]]] = None,
+) -> tuple[int, int, int, int]:
+    """Draw an identifying label fully inside the image, avoiding other labels."""
+    x0, y0, x1, y1 = bbox
+    height, width = image.shape[:2]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.5
+    thickness = 1
+    (text_width, text_height), baseline = cv2.getTextSize(agent_id, font, font_scale, thickness)
+    while text_width > width - 2 and font_scale > 0.3:
+        font_scale -= 0.05
+        (text_width, text_height), baseline = cv2.getTextSize(agent_id, font, font_scale, thickness)
+
+    text_x = min(max(0, x0), max(0, width - text_width - 1))
+    min_baseline = text_height + baseline
+    max_baseline = max(min_baseline, height - baseline - 1)
+    preferred_baselines = [y0 - 6, y1 + text_height + baseline + 4]
+    preferred_baselines.extend(range(min_baseline, max_baseline + 1, text_height + baseline + 3))
+    candidate_baselines = sorted(
+        {min(max_baseline, max(min_baseline, value)) for value in preferred_baselines},
+        key=lambda value: abs(value - (y0 - 6)),
+    )
+    occupied_labels = occupied_labels or []
+
+    def label_bounds(text_y: int) -> tuple[int, int, int, int]:
+        return (
+            text_x,
+            text_y - text_height - baseline,
+            min(width - 1, text_x + text_width),
+            min(height - 1, text_y + baseline),
+        )
+
+    def overlaps(bounds: tuple[int, int, int, int]) -> bool:
+        return any(
+            not (bounds[2] <= other[0] or bounds[0] >= other[2]
+                 or bounds[3] <= other[1] or bounds[1] >= other[3])
+            for other in occupied_labels
+        )
+
+    text_y = next((value for value in candidate_baselines if not overlaps(label_bounds(value))), candidate_baselines[0])
+    bounds = label_bounds(text_y)
+
+    cv2.rectangle(
+        image,
+        (bounds[0], bounds[1]),
+        (bounds[2], bounds[3]),
+        color,
+        -1,
+    )
+    cv2.putText(image, agent_id, (text_x, text_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+    return bounds
+
+
+def _draw_bbox_and_label(
+    image: np.ndarray,
+    bbox: tuple[int, int, int, int],
+    agent_id: str,
+    color: tuple[int, int, int],
+) -> tuple[int, int, int, int]:
+    """Draw a bbox and keep its identifying label fully inside the image."""
+    cv2.rectangle(image, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color, 3)
+    return _draw_agent_label(image, bbox, agent_id, color)
+
+
 def _generate_agent_bbox_image(
     agent_id: str,
     frame: np.ndarray,
@@ -852,17 +967,7 @@ def _generate_agent_bbox_image(
     y1, x1 = coords.max(axis=0) + 1
 
     color = get_color_for_agent(agent_id)
-    cv2.rectangle(img, (x0, y0), (x1, y1), color, 3)
-
-    # Label with background
-    text = agent_id
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.5
-    thickness = 1
-    (tw, th), baseline = cv2.getTextSize(text, font, font_scale, thickness)
-    text_x, text_y = x0, max(0, y0 - 10)
-    cv2.rectangle(img, (text_x, text_y - th - baseline), (text_x + tw, text_y + baseline), color, -1)
-    cv2.putText(img, text, (text_x, text_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+    _draw_bbox_and_label(img, (x0, y0, x1, y1), agent_id, color)
 
     _, buffer = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
     return base64.b64encode(buffer).decode("utf-8")
@@ -941,7 +1046,7 @@ def _generate_epoch_composite_video(
         composite_img = np.hstack(side_imgs).copy()
 
         # 2. Draw BBoxes for all top agents present in this frame
-        placed_labels = []  # Track (x, y, w, h) of labels in this frame
+        pending_labels = []
         for agent in epoch_agents[f_idx]:
             if agent.instance_id not in top_instance_ids:
                 continue
@@ -972,30 +1077,15 @@ def _generate_epoch_composite_video(
             coords = np.argwhere(composite_mask)
             y0, x0 = coords.min(axis=0)
             y1, x1 = coords.max(axis=0) + 1
-            cv2.rectangle(composite_img, (x0, y0), (x1, y1), color, 3)
+            bbox = (int(x0), int(y0), int(x1), int(y1))
+            cv2.rectangle(composite_img, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color, 3)
+            pending_labels.append((bbox, f"ID:{agent.agent_id}", color))
 
-            text = f"ID:{agent.agent_id}"
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = 0.5
-            thickness = 1
-            (tw, th), baseline = cv2.getTextSize(text, font, font_scale, thickness)
-            label_x = int(x0)
-            label_y = max(0, int(y0) - 10)
-
-            for shift in range(0, 100, 20):
-                label_rect = (label_x, label_y - th - baseline - shift, label_x + tw, label_y + baseline - shift)
-                overlaps_label = any(
-                    not (label_rect[2] <= prev[0] or label_rect[0] >= prev[2]
-                         or label_rect[3] <= prev[1] or label_rect[1] >= prev[3])
-                    for prev in placed_labels
-                )
-                if not overlaps_label:
-                    label_y -= shift
-                    break
-
-            cv2.rectangle(composite_img, (label_x, label_y - th - baseline), (label_x + tw, label_y + baseline), color, -1)
-            cv2.putText(composite_img, text, (label_x, label_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
-            placed_labels.append((label_x, label_y - th - baseline, label_x + tw, label_y + baseline))
+        occupied_labels = []
+        for bbox, agent_id, color in pending_labels:
+            occupied_labels.append(
+                _draw_agent_label(composite_img, bbox, agent_id, color, occupied_labels)
+            )
 
         video_frames.append(composite_img)
 
@@ -1045,6 +1135,89 @@ def _generate_epoch_composite_video(
         return base64.b64encode(f.read()).decode("utf-8")
 
 
+def _hazard_object_id(reason_text: str) -> Optional[str]:
+    try:
+        parsed = json.loads(reason_text)
+        hazards = parsed if isinstance(parsed, list) else parsed.get("hazards", [])
+        if hazards and isinstance(hazards[0], dict):
+            return hazards[0].get("object_id")
+    except (TypeError, ValueError, AttributeError):
+        pass
+    return None
+
+
+def _encode_frame_image(frame: np.ndarray) -> str:
+    success, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+    return base64.b64encode(buffer).decode("utf-8") if success else ""
+
+
+def _build_hazard_scoring_media(
+    reasons: list[tuple[str, float]],
+    agents: list[DetectedAgent],
+    frames: any,
+    epoch_agents: Optional[list[list[DetectedAgent]]] = None,
+) -> list[list[dict]]:
+    """Return visual evidence scoped to the agent in each hazard interpretation."""
+    media_by_reason = []
+    agent_ids = {agent.agent_id for agent in agents}
+
+    for reason_text, _ in reasons:
+        object_id = _hazard_object_id(reason_text)
+        if object_id in agent_ids:
+            if epoch_agents is not None:
+                video = _generate_agent_bbox_video(object_id, epoch_agents, frames)
+                media_by_reason.append(
+                    [{"type": "video", "content": video, "agent_id": object_id}] if video else []
+                )
+                continue
+
+            agent = next(agent for agent in agents if agent.agent_id == object_id)
+            side = agent.side
+            if isinstance(frames, dict):
+                side_frames = frames.get(side)
+                if isinstance(side_frames, list):
+                    frame = side_frames[min(agent.frame, len(side_frames) - 1)] if side_frames else None
+                else:
+                    frame = side_frames
+            elif isinstance(frames, list):
+                frame = frames[min(agent.frame, len(frames) - 1)] if frames else None
+            else:
+                frame = frames
+
+            mask = agent.masks.get(side)
+            image = _generate_agent_bbox_image(object_id, frame, mask) if frame is not None and mask is not None else ""
+            media_by_reason.append(
+                [{"type": "image", "content": image, "agent_id": object_id}] if image else []
+            )
+            continue
+
+        if object_id in (None, "unknown", "environment"):
+            if epoch_agents is not None:
+                video = _generate_epoch_composite_video([], epoch_agents, frames)
+                media_by_reason.append([{"type": "video", "content": video}] if video else [])
+            else:
+                source_frames = []
+                if isinstance(frames, dict):
+                    for side_frames in frames.values():
+                        frame = side_frames[-1] if isinstance(side_frames, list) and side_frames else side_frames
+                        if frame is not None:
+                            source_frames.append(frame)
+                elif isinstance(frames, list) and frames:
+                    source_frames.append(frames[-1])
+                elif frames is not None:
+                    source_frames.append(frames)
+                media_by_reason.append([
+                    {"type": "image", "content": image}
+                    for frame in source_frames
+                    if (image := _encode_frame_image(frame))
+                ])
+            continue
+
+        media_by_reason.append([])
+
+    return media_by_reason
+
+
 def _generate_agent_bbox_video(
     agent_id: str,
     epoch_agents: list[list[DetectedAgent]],
@@ -1056,12 +1229,6 @@ def _generate_agent_bbox_video(
     Caches the video and returns the base64 encoded video string.
     """
     VIDEO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    video_path = VIDEO_CACHE_DIR / f"{agent_id}.mp4"
-
-    if video_path.exists():
-        with open(video_path, "rb") as f:
-            return base64.b64encode(f.read()).decode("utf-8")
-
     # Find all appearances of the agent to determine the primary side
     agent_appearances = []
     for f_idx, frame_agents in enumerate(epoch_agents):
@@ -1080,6 +1247,22 @@ def _generate_agent_bbox_video(
     if not side_frames:
         return ""
 
+    cache_digest = hashlib.sha256(agent_id.encode())
+    cache_digest.update(primary_side.encode())
+    for frame in side_frames:
+        cache_digest.update(np.ascontiguousarray(frame).view(np.uint8))
+    for frame_agents in epoch_agents:
+        for agent in frame_agents:
+            if agent.agent_id == agent_id:
+                mask = agent.masks.get(primary_side)
+                if mask is not None:
+                    cache_digest.update(np.ascontiguousarray(mask, dtype=np.uint8).view(np.uint8))
+    video_path = VIDEO_CACHE_DIR / f"{agent_id}_{cache_digest.hexdigest()[:16]}.mp4"
+
+    if video_path.exists():
+        with open(video_path, "rb") as f:
+            return base64.b64encode(f.read()).decode("utf-8")
+
     video_frames = []
     for f_idx in range(len(side_frames)):
         img = side_frames[f_idx].copy()
@@ -1094,19 +1277,8 @@ def _generate_agent_bbox_video(
                 y0, x0 = coords.min(axis=0)
                 y1, x1 = coords.max(axis=0) + 1
 
-                # Draw BBox
                 color = get_color_for_agent(agent_id)
-                cv2.rectangle(img, (x0, y0), (x1, y1), color, 3)
-
-                # Draw ID with background
-                text = agent_id
-                font = cv2.FONT_HERSHEY_SIMPLEX
-                font_scale = 0.5
-                thickness = 1
-                (tw, th), baseline = cv2.getTextSize(text, font, font_scale, thickness)
-                text_x, text_y = x0, max(0, y0 - 10)
-                cv2.rectangle(img, (text_x, text_y - th - baseline), (text_x + tw, text_y + baseline), color, -1)
-                cv2.putText(img, text, (text_x, text_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+                _draw_bbox_and_label(img, (x0, y0, x1, y1), agent_id, color)
 
         video_frames.append(img)
 
@@ -1215,6 +1387,12 @@ def _humanize_hazards(hazard_payload: Union[str, dict]) -> str:
         hazards = parsed.get("hazards", [])
     else:
         return str(hazard_payload)
+
+    if not hazards:
+        return (
+            "No hazard was proposed (the hazards array is empty). Treat this as a no-hazard interpretation; "
+            "inspect the attached scene visuals to verify whether the scene is clear."
+        )
 
     for i, h in enumerate(hazards):
         oid = h.get("object_id", "unknown")
@@ -1403,187 +1581,197 @@ def generate_hazard_viz_video(
     epoch_agents: list[list[DetectedAgent]],
     reasons_detail: list[dict],
     epoch_telemetry: Optional[list[TelemetryData]] = None,
+    raw_start_frame: int = 0,
+    mask_threshold: float = 0.0,
 ) -> str:
     """
-    Generates a video visualization of the top 4 hazards identified in the risk assessment.
-    Each hazard is highlighted by its segmentation mask with a distinct color.
-    Now supports composite 360° view and correct color spacing, plus telemetry overlay.
+    Render one epoch's current hazard clip and save its masks/metadata for the
+    independent full-video renderer. Scores use the per-reason expected score
+    on the 1-5 scale; a threshold of 0.0 includes every flagged hazard.
     """
-    # 1. Identify the top 4 unique hazard IDs based on softmax weight
-    valid_reasons = [r for r in reasons_detail if r.get("hazards")]
-    sorted_reasons = sorted(
-        valid_reasons,
-        key=lambda r: r.get("softmax_weight", r.get("weight", 0.0)),
-        reverse=True
-    )
-
-    top_hazard_ids = []
-    for r in sorted_reasons:
-        if not r["hazards"]: continue
-        oid = r["hazards"][0].get("object_id")
-        if oid and oid not in top_hazard_ids:
-            top_hazard_ids.append(oid)
-        if len(top_hazard_ids) >= 4:
-            break
-
-    COLORS = [
-        (0, 0, 255),   # Red (in BGR: Blue=0, Green=0, Red=255)
-        (0, 165, 255), # Orange
-        (0, 255, 255), # Yellow
-        (255, 0, 255), # Magenta
-    ]
-
-    out_dir = Path(output_path).parent
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Determine available sides for composite view
-    target_sides = ['left', 'front', 'right', 'back']
-    available_sides = []
+    target_sides = ("left", "front", "right", "back")
     if isinstance(frames, dict):
-        available_sides = [s for s in target_sides if s in frames]
-    elif isinstance(frames, list):
-        available_sides = ['front']
-
-    if not available_sides:
+        available_sides = [side for side in target_sides if side in frames and frames[side]]
+    elif isinstance(frames, list) and frames:
+        available_sides = ["front"]
+    else:
         return ""
 
-    # Setup Video Writer based on the composite width
-    # We need to determine the width of one frame first and handle overlap correction
-    sample_frame = frames[available_sides[0]][0] if isinstance(frames, dict) else frames[0]
-    h, w_single, _ = sample_frame.shape
+    frame_count = min(len(epoch_agents), *(len(frames[side]) if isinstance(frames, dict) else len(frames) for side in available_sides))
+    if frame_count == 0:
+        return ""
 
-    # Overlap correction: if side_overlap is configured, crop the margins
-    # The projected faces were sampled in range [-1-s, 1+s] and resized to w_single.
-    # The center 90-deg region is the middle 1/(1+s) fraction of the image.
-    import src.tasks.config.utils
-    overlap = src.tasks.config.utils.CONFIG["processing"].get("side_overlap", 0.0)
+    # Collapse multiple reason samples for one object into one displayed agent score.
+    # The highest per-reason expected score is used for the mask and bounding box.
+    agent_classes = {
+        agent.agent_id: agent.class_name
+        for frame_agents in epoch_agents
+        for agent in frame_agents
+    }
+    hazard_info: dict[str, dict] = {}
+    for reason in reasons_detail:
+        score = float(reason.get("expected_score", 0.0))
+        for hazard in reason.get("hazards", []):
+            object_id = hazard.get("object_id")
+            if not object_id or object_id in ("unknown", "environment"):
+                continue
+            item = hazard_info.setdefault(
+                object_id,
+                {"score": score, "class_name": agent_classes.get(object_id, "hazard")},
+            )
+            if score >= item["score"]:
+                item["score"] = score
+                item["class_name"] = agent_classes.get(object_id, item["class_name"])
 
-    if overlap > 0:
-        # Calculate the pixel width of the overlap margin on each side
-        # The original FOV (90 deg) is 2 units wide. The sampled FOV is 2 + 2*overlap units wide.
-        # Margin on one side is 'overlap' units.
-        # Margin in pixels: (overlap / (2 + 2*overlap)) * w_single
-        margin = int((overlap / (2.0 + 2.0 * overlap)) * w_single)
-        effective_w = w_single - 2 * margin
-    else:
-        margin = 0
-        effective_w = w_single
+    ranked_ids = sorted(hazard_info, key=lambda oid: hazard_info[oid]["score"], reverse=True)
+    colors = [(0, 0, 255), (0, 165, 255), (0, 220, 255), (255, 0, 255),
+              (255, 80, 0), (0, 200, 100), (220, 0, 180), (180, 180, 0)]
+    hazard_colors = {oid: colors[index % len(colors)] for index, oid in enumerate(ranked_ids)}
 
-    total_w = effective_w * len(available_sides)
-
-    telemetry_bar_h = 100 if epoch_telemetry else 0
-    total_h = h + telemetry_bar_h
-
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    # Save the original face-space masks and live telemetry so the final-video
+    # renderer can use any replacement source video without rerunning inference.
     video_path = Path(output_path)
-    out = cv2.VideoWriter(str(video_path), fourcc, 10.0, (total_w, total_h))
+    video_path.parent.mkdir(parents=True, exist_ok=True)
+    mask_arrays = {}
+    mask_entries = []
+    for frame_index, frame_agents in enumerate(epoch_agents[:frame_count]):
+        for agent in frame_agents:
+            if agent.agent_id not in hazard_info:
+                continue
+            for side, mask in agent.masks.items():
+                if side not in available_sides or mask is None or not np.any(mask):
+                    continue
+                array_key = f"mask_{len(mask_entries):05d}"
+                mask_arrays[array_key] = np.asarray(mask, dtype=np.uint8)
+                mask_entries.append({
+                    "frame_index": frame_index,
+                    "object_id": agent.agent_id,
+                    "side": side,
+                    "array_key": array_key,
+                })
 
-    # Telemetry plot configuration
-    metrics = [
-        {"name": "Speed (km/h)", "key": "speed_kmh", "color": (0, 255, 0), "min": 0, "max": 120},
-        {"name": "Roll (deg)", "key": "roll", "color": (255, 0, 0), "min": -30, "max": 30},
-        {"name": "Yaw Rate (deg/s)", "key": "yaw_rate", "color": (0, 255, 255), "min": -60, "max": 60},
-        {"name": "Accel (m/s²)", "key": "a_ego", "color": (255, 0, 255), "min": -5, "max": 5},
+    telemetry_fields = tuple(TelemetryData.__dataclass_fields__)
+    telemetry_payload = [
+        {field_name: float(getattr(sample, field_name)) for field_name in telemetry_fields}
+        for sample in (epoch_telemetry or [])
     ]
+    sidecar_path = video_path.with_suffix(".npz")
+    sidecar_metadata = {
+        "raw_start_frame": int(raw_start_frame),
+        "frame_count": frame_count,
+        "side_overlap": float(CONFIG.get("processing", {}).get("side_overlap", 0.0)),
+        "available_sides": available_sides,
+        "mask_entries": mask_entries,
+        "hazards": hazard_info,
+        "reasons": reasons_detail,
+        "telemetry": telemetry_payload,
+    }
+    np.savez_compressed(
+        sidecar_path,
+        metadata=np.asarray(json.dumps(sidecar_metadata, ensure_ascii=False)),
+        **mask_arrays,
+    )
 
+    # Build the existing epoch clip from projected views, preserving its path/API.
+    sample = frames[available_sides[0]][0] if isinstance(frames, dict) else frames[0]
+    frame_height, frame_width = sample.shape[:2]
+    overlap = max(0.0, sidecar_metadata["side_overlap"])
+    margin = int((overlap / (2.0 + 2.0 * overlap)) * frame_width) if overlap else 0
+    face_width = frame_width - 2 * margin
+    output_width = face_width * len(available_sides)
+    telemetry_height = 90 if telemetry_payload else 0
+    output_height = frame_height + telemetry_height
+    writer_size = (output_width - output_width % 2, output_height - output_height % 2)
+    if min(writer_size) < 2:
+        raise ValueError(f"Invalid hazard visualization dimensions: {output_width}x{output_height}")
 
-    for f_idx in range(len(epoch_agents)):
-        # 1. Build the composite frame
-        side_imgs = []
-        side_offsets = {}
-        current_offset = 0
-        for side in available_sides:
-            img = frames[side][f_idx] if isinstance(frames, dict) else frames[f_idx]
+    writer = cv2.VideoWriter(
+        str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), 10.0, writer_size
+    )
+    if not writer.isOpened():
+        writer.release()
+        raise RuntimeError(f"Could not open hazard video writer for {video_path}")
 
-            # Correct overlap: crop the margins from both sides
-            if overlap > 0:
-                img = img[:, margin : w_single - margin]
+    metric_specs = (
+        ("SPEED", "speed_kmh", "km/h"),
+        ("ROLL", "roll", "deg"),
+        ("YAW RATE", "yaw_rate", "deg/s"),
+        ("ACCEL", "a_ego", "m/s2"),
+    )
+    try:
+        for frame_index in range(frame_count):
+            face_images = []
+            side_offsets = {}
+            x_offset = 0
+            for side in available_sides:
+                image = frames[side][frame_index] if isinstance(frames, dict) else frames[frame_index]
+                image = image[:, margin:frame_width - margin] if margin else image
+                face_images.append(image)
+                side_offsets[side] = x_offset
+                x_offset += image.shape[1]
 
-            side_imgs.append(img)
-            side_offsets[side] = current_offset
-            current_offset += img.shape[1]
+            composite = np.hstack(face_images).copy()
+            if telemetry_height:
+                telemetry_sample = telemetry_payload[min(frame_index, len(telemetry_payload) - 1)]
+                bar = np.full((telemetry_height, output_width, 3), 24, dtype=np.uint8)
+                slot_width = output_width // len(metric_specs)
+                for metric_index, (label, key, unit) in enumerate(metric_specs):
+                    x = metric_index * slot_width
+                    value = telemetry_sample.get(key, 0.0)
+                    cv2.putText(bar, label, (x + 20, 32), cv2.FONT_HERSHEY_DUPLEX, 0.55,
+                                (160, 175, 185), 1, cv2.LINE_AA)
+                    cv2.putText(bar, f"{value:.1f} {unit}", (x + 20, 68),
+                                cv2.FONT_HERSHEY_DUPLEX, 0.8, (245, 245, 245), 2, cv2.LINE_AA)
+                composite = np.vstack((bar, composite))
 
-        composite_img = np.hstack(side_imgs).copy()
-        frame_agents = epoch_agents[f_idx]
-
-        # Draw Telemetry Bar
-        if epoch_telemetry:
-            bar = np.zeros((telemetry_bar_h, total_w, 3), dtype=np.uint8)
-            num_metrics = len(metrics)
-            slot_w = total_w // num_metrics
-            for i, m in enumerate(metrics):
-                x_start = i * slot_w
-                x_end = (i + 1) * slot_w
-                # Draw slot background
-                cv2.rectangle(bar, (x_start, 0), (x_end, telemetry_bar_h), (40, 40, 40), -1)
-                cv2.putText(bar, m["name"], (x_start + 5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
-
-                # Draw sparkline
-                points = []
-                telemetry_samples = min(f_idx + 1, len(epoch_telemetry))
-                for f_idx_plot in range(telemetry_samples):
-                    val = getattr(epoch_telemetry[f_idx_plot], m["key"], 0.0)
-                    norm_val = (val - m["min"]) / (m["max"] - m["min"])
-                    y = telemetry_bar_h - 10 - (norm_val * (telemetry_bar_h - 40))
-                    x = x_start + 10 + (f_idx_plot / (len(epoch_agents) - 1) * (slot_w - 20)) if len(epoch_agents) > 1 else x_start + 10
-                    points.append((int(x), int(y)))
-
-                if len(points) >= 2:
-                    cv2.polylines(bar, [np.array(points, np.int32)], False, m["color"], 2, cv2.LINE_AA)
-
-            composite_img = np.vstack([bar, composite_img])
-
-
-        # 2. Draw Highlights for Top Hazards
-        for rank, oid in enumerate(top_hazard_ids):
-            color = COLORS[rank] if rank < len(COLORS) else (255, 255, 255)
-            agent = next((a for a in frame_agents if a.agent_id == oid), None)
-
-            if agent:
-                composite_mask = np.zeros((h, total_w), dtype=bool)
+            # Render every flagged agent meeting the threshold, not only the top four.
+            for object_id in ranked_ids:
+                if hazard_info[object_id]["score"] < mask_threshold:
+                    continue
+                agent = next(
+                    (item for item in epoch_agents[frame_index] if item.agent_id == object_id),
+                    None,
+                )
+                if agent is None:
+                    continue
+                combined_mask = np.zeros((frame_height, output_width), dtype=bool)
                 for side in agent.fused_sides:
                     if side not in side_offsets:
                         continue
                     mask = agent.masks.get(side)
-                    if mask is None or not np.any(mask):
+                    if mask is None:
                         continue
-                    cropped_mask = mask[:, margin:mask.shape[1] - margin] if margin else mask
-                    offset_x = side_offsets[side]
-                    end_x = min(offset_x + cropped_mask.shape[1], total_w)
-                    if end_x > offset_x:
-                        composite_mask[:, offset_x:end_x] |= cropped_mask[:, :end_x - offset_x]
+                    cropped = mask[:, margin:mask.shape[1] - margin] if margin else mask
+                    x0 = side_offsets[side]
+                    width = min(cropped.shape[1], output_width - x0)
+                    height = min(cropped.shape[0], frame_height)
+                    if width > 0 and height > 0:
+                        combined_mask[:height, x0:x0 + width] |= cropped[:height, :width]
+                if not np.any(combined_mask):
+                    continue
 
-                if np.any(composite_mask):
-                    full_mask = np.zeros((total_h, total_w), dtype=bool)
-                    full_mask[telemetry_bar_h:telemetry_bar_h + h] = composite_mask
-                    overlay = composite_img.copy()
-                    overlay[full_mask] = color
-                    cv2.addWeighted(overlay, 0.5, composite_img, 0.5, 0, composite_img)
+                color = hazard_colors[object_id]
+                image_y = telemetry_height
+                view = composite[image_y:image_y + frame_height]
+                view[combined_mask] = (
+                    0.55 * view[combined_mask] + 0.45 * np.asarray(color)
+                ).astype(np.uint8)
+                y_coords, x_coords = np.where(combined_mask)
+                x0, x1 = int(x_coords.min()), int(x_coords.max())
+                y0, y1 = int(y_coords.min()) + image_y, int(y_coords.max()) + image_y
+                cv2.rectangle(composite, (x0, y0), (x1, y1), color, 2)
+                label = f"{agent.class_name}  RISK {hazard_info[object_id]['score']:.2f}/5"
+                cv2.putText(composite, label, (x0, max(image_y + 24, y0 - 8)),
+                            cv2.FONT_HERSHEY_DUPLEX, 0.55, color, 2, cv2.LINE_AA)
 
-                    coords = np.argwhere(composite_mask)
-                    y0, x0 = coords.min(axis=0)
-                    y1, x1 = coords.max(axis=0) + 1
-                    y0 += telemetry_bar_h
-                    y1 += telemetry_bar_h
-                    cv2.rectangle(composite_img, (x0, y0), (x1, y1), color, 3)
-                    label = f"Hazard {rank+1}: {agent.class_name}"
+            if composite.shape[1] != writer_size[0] or composite.shape[0] != writer_size[1]:
+                composite = cv2.resize(composite, writer_size, interpolation=cv2.INTER_AREA)
+            writer.write(cv2.cvtColor(composite, cv2.COLOR_RGB2BGR))
+    finally:
+        writer.release()
 
-                    font = cv2.FONT_HERSHEY_SIMPLEX
-                    font_scale = 0.6
-                    thickness = 2
-                    (tw, th), baseline = cv2.getTextSize(label, font, font_scale, thickness)
-                    text_x, text_y = x0, max(telemetry_bar_h, y0 - 10)
-                    cv2.rectangle(composite_img, (text_x, text_y - th - baseline), (text_x + tw, text_y + baseline), color, -1)
-                    cv2.putText(composite_img, label, (text_x, text_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
-
-        # 3. Correct Color Format: RGB -> BGR for OpenCV VideoWriter
-        final_frame = cv2.cvtColor(composite_img, cv2.COLOR_RGB2BGR)
-        out.write(final_frame)
-
-    out.release()
-
-    with open(video_path, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
+    with open(video_path, "rb") as video_file:
+        return base64.b64encode(video_file.read()).decode("utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -1812,6 +2000,7 @@ class RiskAssessmentEngine:
                     epoch_id        = context.get("epoch_id", "latest"),
                     exclude_ids     = extracted_ids,
                     include_multimodal = False,
+                    recent_track_context = context.get("recent_track_context"),
                 )
             else:
                 scene_block, current_multimodal = _build_scene_block(
@@ -1870,9 +2059,13 @@ class RiskAssessmentEngine:
                     # Total failure for this sample
                     continue
 
+            hazards = reason_item.get("hazards")
+            if not isinstance(hazards, list) or not hazards:
+                logger.debug("Skipping reason sample %d because it returned no hazards", i)
+                continue
 
             # Sanitize hazards
-            for h in reason_item.get("hazards", []):
+            for h in hazards:
                 if not isinstance(h, dict):
                     continue
 
@@ -1893,7 +2086,7 @@ class RiskAssessmentEngine:
                     h["danger_reasoning"] = _strip_meta_preface(h.get("danger_reasoning", "")).strip()
 
             # Track extracted IDs to prevent duplicates in subsequent samples
-            for h in reason_item.get("hazards", []):
+            for h in hazards:
                 if isinstance(h, dict) and h.get("object_id") and h.get("object_id") not in extracted_ids:
                     extracted_ids.append(h["object_id"])
 
@@ -1925,7 +2118,7 @@ class RiskAssessmentEngine:
         scene_block:  str,
         reasons:      list[tuple[str, float]],
         score_scale:  list[int],
-        multimodal_items: list[dict] = None,
+        reason_multimodal_items: list[list[dict]] = None,
     ) -> tuple[list[dict[int, float]], list[str], str]:
         """
         Score each reason independently with a dedicated model call.
@@ -1938,11 +2131,16 @@ class RiskAssessmentEngine:
 
         for idx, reason in enumerate(reasons):
             prompt = _build_reason_scoring_prompt(scene_block, reason, idx)
+            visual_evidence = (
+                reason_multimodal_items[idx]
+                if reason_multimodal_items and idx < len(reason_multimodal_items)
+                else []
+            )
             # Use the retry helper for LLM call and JSON extraction
             response, payload = self._call_llm_with_retry(
                 prompt = prompt,
                 temperature = 0.2,
-                multimodal_items = multimodal_items,
+                multimodal_items = visual_evidence,
                 logprobs = True,
                 top_logprobs = 10,
             )
@@ -2211,6 +2409,20 @@ class RiskAssessmentEngine:
             for frame_segs in segmented_items
         ]
         all_agents_flat = [a for frame in epoch_agents for a in frame]
+        recent_track_context = {}
+        for frame_segments in segmented_items:
+            for segment in frame_segments:
+                history = segment.get("recent_history")
+                if not history:
+                    continue
+                agent_id = f"agent_{segment.get('instance_id', -1)}"
+                context = {
+                    "history": history,
+                    "history_rescued": bool(segment.get("history_rescued")),
+                }
+                previous = recent_track_context.get(agent_id)
+                if previous is None or history["matched_frame"] > previous["history"]["matched_frame"]:
+                    recent_track_context[agent_id] = context
 
         # --- Risk Map Integration ---
         agent_risks = {}
@@ -2246,12 +2458,19 @@ class RiskAssessmentEngine:
             "frames": frames,
             "telemetry": telemetry,
             "agent_risks": agent_risks,
-            "epoch_id": epoch_id
+            "epoch_id": epoch_id,
+            "recent_track_context": recent_track_context,
         }
 
         # Initial multimodal content for the first sample
         first_block, multimodal_content = _build_epoch_scene_block(
-            env_description, epoch_agents, frames, telemetry, agent_risks=agent_risks, epoch_id=epoch_id
+            env_description,
+            epoch_agents,
+            frames,
+            telemetry,
+            agent_risks=agent_risks,
+            epoch_id=epoch_id,
+            recent_track_context=recent_track_context,
         )
         scene_block = first_block
 
@@ -2285,8 +2504,11 @@ class RiskAssessmentEngine:
                 },
             }
 
+        reason_multimodal_items = _build_hazard_scoring_media(
+            reasons, all_agents_flat, frames, epoch_agents=epoch_agents
+        )
         score_dists, critiques, fallback_note = self._score_synthesized(
-            scene_block, reasons, score_scale, multimodal_content
+            scene_block, reasons, score_scale, reason_multimodal_items
         )
 
         # New severity-weighted softmax fusion
@@ -2371,7 +2593,7 @@ class RiskAssessmentEngine:
         }
 
         # Initial multimodal content for the first sample
-        _, multimodal_content = _build_scene_block(
+        scene_block, multimodal_content = _build_scene_block(
             env_description, agents, frames, telemetry, agent_risks=agent_risks
         )
 
@@ -2404,8 +2626,9 @@ class RiskAssessmentEngine:
                 },
             }
 
+        reason_multimodal_items = _build_hazard_scoring_media(reasons, agents, frames)
         score_dists, critiques, fallback_note = self._score_synthesized(
-            scene_block, reasons, score_scale, multimodal_content
+            scene_block, reasons, score_scale, reason_multimodal_items
         )
 
         # New severity-weighted softmax fusion

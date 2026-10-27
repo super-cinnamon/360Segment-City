@@ -14,6 +14,7 @@ except RuntimeError:
     pass
 
 import cv2
+import numpy as np
 from PIL import Image
 
 from matplotlib import image
@@ -99,19 +100,34 @@ def unload_world_model(model_name: Optional[str] = None):
 
 
 # * here we query the world model to describe the environment, we will be adding the segmentation of the static objects in the prompt here, will be completed next time
-def query_world_model(prompt=ENV_PROMPT, images=[], model=CONFIG["vlm"]["world_model"]["model_name"]):
+def query_world_model(
+    prompt=ENV_PROMPT,
+    images=None,
+    model=CONFIG["vlm"]["world_model"]["model_name"],
+    video_frames=None,
+):
     # ! add here the static objects from segmentation
     # Load the world model
     world_model = load_world_model(model=model)
 
-    # Convert images to PIL format
-    print(f"DEBUG: query_world_model images count: {len(images)}")
-    if len(images) > 0:
-        print(f"DEBUG: first image type: {type(images[0])}")
-    pil_images = [Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)) for image in images]
+    content = []
+    if video_frames is not None:
+        video_frames = list(video_frames)
+        print(f"DEBUG: query_world_model video frame count: {len(video_frames)}")
+        if video_frames:
+            rgb_video = np.stack(
+                [cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) for frame in video_frames]
+            )
+            content.append({"type": "video", "video": rgb_video})
+    else:
+        images = images or []
+        print(f"DEBUG: query_world_model images count: {len(images)}")
+        if images:
+            print(f"DEBUG: first image type: {type(images[0])}")
+        pil_images = [Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)) for image in images]
+        content.extend({"type": "image", "image": img} for img in pil_images)
 
     # Use the same Hugging Face generation flow on Linux as on Windows.
-    content = [{"type": "image", "image": img} for img in pil_images]
     content.append({"type": "text", "text": prompt})
     message = [
         {
