@@ -129,16 +129,62 @@ configuration loader reads this file at startup.
 | `depth_estimation` | Selects Marigold or YOLO depth and configures each model. |
 | `segmentation` | Configures the OneFormer model, class labels, and thresholds. |
 | `flow_estimation` | Selects the optical-flow model. |
-| `vlm` | Configures the Ollama and world-model names and sampling settings. |
+| `vlm` | Selects a VLM profile and configures model backends, repositories, and sampling settings. |
 | `processing` | Controls panorama views, frame sizing, ROI gating, frame pruning, and telemetry. |
 | `risk_assessment` | Sets the local API URL, model, epoch window, and score parameters. |
 | `risk_map` | Controls risk-map model, weights, and hyperparameters. |
 | `fragment_merging` | Configures merging of fragmented detections. |
 
 The world-model API is configured for `http://localhost:5015/v1` and is started
-in-process by `run_full_process.py`. Its default model is `nvidia/Cosmos3-Nano`.
-The model is loaded when the API handles inference requests, so model access and
-hardware requirements apply to the VLM as well as the vision models.
+by `run_full_process.py`. VLM profiles are listed under
+`vlm.models`; `vlm.selected_model` chooses the profile used by default. Changing
+the selection affects only that run/profile; the other model backends remain
+available for quick switching.
+
+Each profile declares a `repo_id`, `backend`, and video capability. Set a
+candidate's exact Hugging Face repository in `repo_id` and verify that the
+checkpoint accepts the pipeline's video inputs before setting
+`supports_video` to `true`. Qwen 3.8 and both Gemma 4 profiles use the
+in-process Unsloth `FastVisionModel` loader. Nemotron 3 Nano Omni is a GGUF
+profile served by a separate `llama-server` process; install a llama.cpp build
+with multimodal support and make `llama-server` available on `PATH` before
+selecting it. Download its configured model and projector files with:
+
+```bash
+python scripts/download_vlm_models.py --model nemotron-3-nano-omni-30b-a3b-reasoning
+```
+
+The local API starts the GGUF server only when that profile is selected. Other
+profiles continue to use their configured in-process backend. The text-only
+Nemotron Bolt model is not in the selectable catalog.
+Profiles using the `unsloth` backend load Unsloth lazily; install its runtime
+for the active PyTorch/CUDA environment before selecting them. The Cosmos
+profile uses Transformers and does not require Unsloth.
+
+Use the config for a persistent default or `--model` for a one-run override;
+the CLI value does not rewrite `config.json`:
+
+```bash
+python run_full_process.py --sample_dir data/sample_1
+python run_full_process.py --sample_dir data/sample_1 --model cosmos3-nano
+```
+
+Run outputs are placed under `data/outputs/<sample>/<profile>_<uuid>/`, with
+matching visualization directories and a `run_metadata.json` recording the
+profile, repository, backend, and run ID.
+
+Download configured profile files into the Hugging Face disk cache without
+loading model weights into RAM or GPU:
+
+```bash
+python scripts/download_vlm_models.py
+python scripts/download_vlm_models.py --model gemma-4-26b-a4b --cache-dir /path/to/hf-cache
+```
+
+The Nano Omni profile downloads only its Q4_K_M GGUF and F16 vision projector,
+not every quantization in the upstream repository. GGUF inference still
+requires a compatible serving backend; the current local Transformers/Unsloth
+loader reports this profile as unsupported for pipeline inference.
 
 ## Depth estimation
 

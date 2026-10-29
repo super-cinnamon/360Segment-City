@@ -64,9 +64,9 @@
         "score_threshold": 0.8,
         "depth_threshold": 0.3,
         "min_depth": {
-            "back": 0.1,
+            "back": 0.11,
             "front": 0.01,
-            "sides": 0.05
+            "sides": 0.08
         }
     },
     "agent_persistence": {
@@ -74,6 +74,56 @@
         "score_floor": 0.2
     },
     "vlm": {
+        "selected_model": "cosmos3-nano",
+        "models": {
+            "cosmos3-nano": {
+                "label": "NVIDIA Cosmos 3 Nano",
+                "repo_id": "nvidia/Cosmos3-Nano",
+                "backend": "transformers",
+                "supports_video": true,
+                "load_options": {}
+            },
+            "qwen-3.8-27b-nvfp4": {
+                "label": "Qwen 3.8 27B NVFP4",
+                "repo_id": "unsloth/Qwen3.8-27B-NVFP4",
+                "backend": "unsloth",
+                "supports_video": true,
+                "quantization": "nvfp4",
+                "load_options": {}
+            },
+            "nemotron-3-nano-omni-30b-a3b-reasoning": {
+                "label": "NVIDIA Nemotron 3 Nano Omni 30B A3B Reasoning (GGUF)",
+                "repo_id": "unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF",
+                "backend": "llama.cpp",
+                "artifact_format": "gguf",
+                "model_file": "NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-UD-Q4_K_M.gguf",
+                "mmproj_file": "mmproj-F16.gguf",
+                "server_port": 5016,
+                "context_size": 8192,
+                "supports_video": true,
+                "download_patterns": [
+                    "NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-UD-Q4_K_M.gguf",
+                    "mmproj-F16.gguf"
+                ],
+                "load_options": {}
+            },
+            "gemma-4-12b": {
+                "label": "Gemma 4 12B",
+                "repo_id": "unsloth/gemma-4-12b-it-NVFP4",
+                "backend": "unsloth",
+                "supports_video": true,
+                "quantization": "nvfp4",
+                "load_options": {}
+            },
+            "gemma-4-26b-a4b": {
+                "label": "Gemma 4 26B A4B",
+                "repo_id": "unsloth/gemma-4-26B-A4B-it-NVFP4",
+                "backend": "unsloth",
+                "supports_video": true,
+                "quantization": "nvfp4",
+                "load_options": {}
+            }
+        },
         "ollama": {
             "model_name": "gemma4:e2b",
             "temperature": 0.7
@@ -85,12 +135,12 @@
     },
     "processing": {
         "roi_enabled": true,
-        "roi_threshold": 0.4,
+        "roi_threshold": 0.35,
         "image_scale": 0.4,
         "use_imu_telemetry": true,
         "prune_similar_frames": false,
         "frame_similarity_threshold": 2.0,
-        "side_overlap": 0.08,
+        "side_overlap": 0.1,
         "side_overlap_matching": {
             "min_coverage": 0.2,
             "min_pixels": 4
@@ -133,5 +183,24 @@
             "depth_consistency": 0.3,
             "boundary_alignment": 0.2
         }
+    },
+    "yoloe": {
+        "model_name": "yoloe-26x-seg.pt",
+        "confidence_threshold": 0.25,
+        "iou_threshold_merge": 0.9,
+        "iou_threshold_associate": 0.5,
+        "risk_boost_factor": 1.2
+    },
+    "vlm_hazard_identification": {
+        "model_name": "gemma-4-26b-a4b",
+        "prompt_template": "src/tasks/prompts/hazard_identification.md"
+    },
+    "hazard_classes": {
+        "environment_hazards": [
+            "pothole", "wet road", "debris", "construction zone",
+            "oil spill", "gravel", "railroad crossing", "speed bump",
+            "faded lane marking", "sun glare", "standing water", "ice patch"
+        ],
+        "dynamic_agents": ["person", "rider", "car", "truck", "bus", "motorcycle", "bicycle"]
     }
 }

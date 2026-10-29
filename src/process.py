@@ -32,6 +32,10 @@ from src.tasks.risk_assessment import (
     compute_depth_bounds,
 )
 from src.tasks.risk_map import RiskMapEngine
+from src.tasks.yoloe_segmentation import YOLOESegmenter, create_yoloe_segmenter
+from src.tasks.vlm_hazard_identification import VLMHazardIdentifier, create_vlm_hazard_identifier
+from src.tasks.hazard_agent_merger import HazardAgentMerger, create_hazard_agent_merger
+from src.tasks.hazard_visualization import HazardDetectionLogger, create_hazard_logger, visualize_risk_map
 logger = logging.getLogger(__name__)
 
 from src.tasks.roi import (
@@ -169,6 +173,93 @@ class VideoProcessor:
                 pickle.dump(result, f)
 
         return result
+
+    def _propagate_hazard_masks(self, agents, prev_frame_idx, curr_frame_idx, flow_maps, all_camera_frames):
+        """
+        Propagate hazard masks from previous frame to current frame using optical flow.
+
+        Args:
+            agents: List of DetectedAgent from previous frame
+            prev_frame_idx: Index of previous frame
+            curr_frame_idx: Index of current frame
+            flow_maps: Dict of {side: list of flow maps} from predict_flows
+            all_camera_frames: Dict of {side: list of frames}
+
+        Returns:
+            List of DetectedAgent with propagated masks for current frame
+        """
+        import cv2
+        from src.tasks.risk_assessment import DetectedAgent
+
+        if not agents:
+            return []
+
+        propagated_agents = []
+
+        for agent in agents:
+            # Create a copy of the agent
+            new_agent = DetectedAgent(
+                agent_id=agent.agent_id,
+                class_name=agent.class_name,
+                side=agent.side,
+                frame=curr_frame_idx,
+                seg_score=agent.seg_score,
+                mode_depth=agent.mode_depth,
+                distance_weight=agent.distance_weight,
+                instance_id=agent.instance_id,
+                fused_sides=agent.fused_sides.copy(),
+                masks={},
+                was_fused=agent.was_fused,
+                mode_flow=agent.mode_flow,
+                flow_description=agent.flow_description
+            )
+
+            # Copy hazard metadata
+            if hasattr(agent, 'hazard_metadata'):
+                new_agent.hazard_metadata = agent.hazard_metadata
+            new_agent.hazard_verified = getattr(agent, 'hazard_verified', False)
+            new_agent.is_environment_hazard = getattr(agent, 'is_environment_hazard', False)
+
+            # Propagate masks for each side using optical flow
+            for side, mask in agent.masks.items():
+                if mask is None or not np.any(mask):
+                    new_agent.masks[side] = mask
+                    continue
+
+                if side in flow_maps and prev_frame_idx < len(flow_maps[side]):
+                    flow = flow_maps[side][prev_frame_idx]  # Flow from prev -> curr
+                    if flow is not None:
+                        # Warp mask using optical flow
+                        h, w = mask.shape
+                        flow_map = flow[0] if isinstance(flow, tuple) else flow
+
+                        # Create coordinate grids
+                        y_coords, x_coords = np.mgrid[0:h, 0:w]
+
+                        # Apply flow to get source coordinates
+                        # flow_map[..., 0] = u (x displacement), flow_map[..., 1] = v (y displacement)
+                        src_x = x_coords - flow_map[..., 0]
+                        src_y = y_coords - flow_map[..., 1]
+
+                        # Clip to valid range
+                        src_x = np.clip(src_x, 0, w - 1)
+                        src_y = np.clip(src_y, 0, h - 1)
+
+                        # Interpolate mask at source coordinates
+                        # Use remap for efficient warping
+                        src_x = src_x.astype(np.float32)
+                        src_y = src_y.astype(np.float32)
+                        warped_mask = cv2.remap(mask.astype(np.float32), src_x, src_y, cv2.INTER_NEAREST)
+                        new_agent.masks[side] = warped_mask > 0.5
+                    else:
+                        new_agent.masks[side] = mask
+                else:
+                    # No flow available, keep original mask
+                    new_agent.masks[side] = mask
+
+            propagated_agents.append(new_agent)
+
+        return propagated_agents
 
     def segment(self, object_name=None):
         # for this model there is no object name so we ignore for now
@@ -725,6 +816,362 @@ class SegmentationPipeline:
             raw_start=raw_start,
             raw_end=raw_end,
         )
+
+        # Build agents from segmented items for hazard merging
+        from src.tasks.risk_assessment import build_agents_from_segments, compute_depth_bounds
+        d_min, d_max = compute_depth_bounds(segmented_items)
+        segmented_agents = [
+            build_agents_from_segments(f, d_min, d_max) for f in segmented_items
+        ]
+
+        # --- TWO-STAGE HAZARD DETECTION PIPELINE (per paper Algorithm 1) ---
+        # Stage 1: VLM Hazard Identification (with motorcycle state)
+        # Stage 2: YOLOE Segmentation for identified hazards
+        # Stage 3: Merge hazards with segmented agents
+
+        # Get front frame for hazard detection (first frame of epoch)
+        front_frame = None
+        if self.video_processor.cubic:
+            front_frames = prepared_frames.get("front", [])
+        else:
+            front_frames = prepared_frames
+
+        if front_frames and len(front_frames) > 0:
+            front_frame = front_frames[0]
+        elif frames and isinstance(frames, dict):
+            front_frame = frames.get("front", [None])[0] if frames.get("front") else None
+        elif frames and isinstance(frames, list) and len(frames) > 0:
+            front_frame = frames[0]
+
+        merged_agents = segmented_agents[0] if segmented_agents else []  # Use first frame's agents
+
+        # Get ALL camera frames for the epoch (for video generation)
+        camera_sides = ["front", "left", "right", "back"]
+        all_camera_frames = {}
+        all_depth_maps = {}
+
+        if self.video_processor.cubic:
+            for side in camera_sides:
+                if side in prepared_frames and prepared_frames[side]:
+                    all_camera_frames[side] = prepared_frames[side]
+                if side in depth_masks and depth_masks[side] and len(depth_masks[side]) > 1:
+                    all_depth_maps[side] = depth_masks[side][1]  # List of depth maps per frame
+        else:
+            # Non-cubic: assume single camera (front)
+            if prepared_frames and isinstance(prepared_frames, list):
+                all_camera_frames["front"] = prepared_frames
+            if depth_masks and "front" in depth_masks:
+                all_depth_maps["front"] = depth_masks["front"][1]
+
+        # Also check original frames
+        if not all_camera_frames and frames and isinstance(frames, dict):
+            for side in camera_sides:
+                if side in frames and frames[side]:
+                    all_camera_frames[side] = frames[side]
+        elif not all_camera_frames and frames and isinstance(frames, list):
+            all_camera_frames["front"] = frames
+
+        # Initialize hazard detection logger for this epoch
+        hazard_logger = create_hazard_logger(epoch_idx=epoch_idx)
+
+        # Check if we have any frames
+        has_frames = any(len(f) > 0 for f in all_camera_frames.values())
+
+        if has_frames and (merged_agents or True):  # Always run hazard detection
+            try:
+                # Get motorcycle state from telemetry
+                speed_kmh = telemetry.speed_kmh if telemetry else 0.0
+                lean_angle_deg = telemetry.roll if telemetry else 0.0
+
+                # Use first available frame (prefer front) for VLM hazard identification
+                first_frame = None
+                first_depth_map = None
+                for side in ["front", "left", "right", "back"]:
+                    if side in all_camera_frames and all_camera_frames[side]:
+                        first_frame = all_camera_frames[side][0]
+                        if side in all_depth_maps and all_depth_maps[side]:
+                            first_depth_map = all_depth_maps[side][0]
+                        break
+
+                if first_frame is None:
+                    raise ValueError("No frames available for hazard detection")
+
+                if first_depth_map is None:
+                    first_depth_map = np.ones(first_frame.shape[:2], dtype=np.float32) * 0.5
+
+                # Stage 1: VLM Hazard Identification (on first frame with motorcycle state)
+                vlm_identifier = create_vlm_hazard_identifier()
+                hazards = vlm_identifier.identify_hazards(first_frame, speed_kmh, lean_angle_deg)
+
+                # Log VLM input (prompt and motorcycle state)
+                vlm_prompt = vlm_identifier._build_prompt(speed_kmh, lean_angle_deg) if hasattr(vlm_identifier, '_build_prompt') else "N/A"
+                hazard_logger.log_vlm_input(first_frame, vlm_prompt, speed_kmh, lean_angle_deg)
+
+                # Log VLM output (raw response and parsed hazards)
+                vlm_raw_response = getattr(vlm_identifier, 'last_raw_response', 'N/A')
+                hazard_logger.log_vlm_output(vlm_raw_response, hazards)
+
+                # Stage 2: YOLOE Segmentation for identified hazards on ALL camera sides (first frame)
+                hazard_labels = [h["label"] for h in hazards] if hazards else []
+                yoloe_results_per_side = {}
+
+                if hazard_labels:
+                    yoloe_segmenter = create_yoloe_segmenter()
+
+                    for side in camera_sides:
+                        if side in all_camera_frames and all_camera_frames[side]:
+                            side_first_frame = all_camera_frames[side][0]
+                            side_results = yoloe_segmenter.segment_hazards(side_first_frame, hazard_labels)
+
+                            # Combine VLM c_vlm with YOLOE results
+                            for h_vlm, h_yoloe in zip(hazards, side_results):
+                                h_yoloe["c_vlm"] = h_vlm.get("c_vlm", 0.0)
+                                h_yoloe["hazard_type"] = h_vlm.get("hazard_type", "environment_hazard")
+                                h_yoloe["description"] = h_vlm.get("description", "")
+
+                            yoloe_results_per_side[side] = side_results
+
+                            # Log YOLOE results for this side
+                            hazard_logger.log_yoloe_results(side_first_frame, hazard_labels, side_results)
+
+                # Stage 3: Merge hazards with segmented agents for each side
+                if merged_agents:
+                    merger = create_hazard_agent_merger()
+
+                    # For each side, merge hazards with agents that have masks on that side
+                    for side in camera_sides:
+                        if side in yoloe_results_per_side:
+                            side_yoloe_results = yoloe_results_per_side[side]
+                            side_depth_map = all_depth_maps[side][0] if side in all_depth_maps and all_depth_maps[side] else first_depth_map
+
+                            # Filter agents that have masks on this side
+                            side_agents = [a for a in merged_agents if side in a.masks and a.masks[side] is not None and np.any(a.masks[side])]
+
+                            if side_agents:
+                                # Create side-specific merged agents
+                                merged_side_agents = merger.merge(side_agents, side_yoloe_results, side_depth_map)
+
+                                # Update the original agents with merged masks for this side
+                                for merged_agent in merged_side_agents:
+                                    # Find corresponding agent in merged_agents
+                                    for orig_agent in merged_agents:
+                                        if orig_agent.agent_id == merged_agent.agent_id:
+                                            # Update mask for this side
+                                            for s, mask in merged_agent.masks.items():
+                                                if mask is not None and np.any(mask):
+                                                    orig_agent.masks[s] = mask
+                                            # Update hazard metadata
+                                            if hasattr(merged_agent, 'hazard_metadata'):
+                                                orig_agent.hazard_metadata = merged_agent.hazard_metadata
+                                            orig_agent.hazard_verified = getattr(merged_agent, 'hazard_verified', False)
+                                            orig_agent.is_environment_hazard = getattr(merged_agent, 'is_environment_hazard', False)
+                                            break
+                            else:
+                                # No existing agents on this side - create new hazard agents
+                                from src.tasks.risk_assessment import DetectedAgent
+                                from src.tasks.depth_estimation import mode_depth
+
+                                for h in side_yoloe_results:
+                                    hazard_mask = h["mask"]
+                                    try:
+                                        hazard_depth = mode_depth(side_depth_map, hazard_mask)
+                                    except Exception:
+                                        hazard_depth = 0.5
+
+                                    hazard_label = h["label"].replace(" ", "_").replace("-", "_")
+                                    agent_id = f"hazard_{hazard_label}_{side}_{len(merged_agents)}"
+                                    distance_weight = 1.0 - hazard_depth
+
+                                    new_agent = DetectedAgent(
+                                        agent_id=agent_id,
+                                        class_name=h["label"],
+                                        side=side,
+                                        frame=0,
+                                        seg_score=min(1.0, h.get("confidence", 0.5) * 1.2),
+                                        mode_depth=hazard_depth,
+                                        distance_weight=distance_weight,
+                                        instance_id=-1,
+                                        fused_sides=[side],
+                                        masks={side: hazard_mask},
+                                        was_fused=False,
+                                        mode_flow=None,
+                                        flow_description=None
+                                    )
+                                    new_agent.hazard_metadata = [{
+                                        "label": h["label"],
+                                        "c_vlm": h.get("c_vlm", 0.0),
+                                        "hazard_type": h.get("hazard_type", "environment_hazard"),
+                                        "description": h.get("description", ""),
+                                        "hazard_confidence": h.get("confidence", 0.0),
+                                        "verified": True
+                                    }]
+                                    new_agent.hazard_verified = True
+                                    new_agent.is_environment_hazard = True
+                                    merged_agents.append(new_agent)
+                else:
+                    # No existing agents at all - create from hazards on all sides
+                    from src.tasks.risk_assessment import DetectedAgent
+                    from src.tasks.depth_estimation import mode_depth
+
+                    for side in camera_sides:
+                        if side in yoloe_results_per_side:
+                            side_yoloe_results = yoloe_results_per_side[side]
+                            side_depth_map = all_depth_maps[side][0] if side in all_depth_maps and all_depth_maps[side] else first_depth_map
+
+                            for h in side_yoloe_results:
+                                hazard_mask = h["mask"]
+                                try:
+                                    hazard_depth = mode_depth(side_depth_map, hazard_mask)
+                                except Exception:
+                                    hazard_depth = 0.5
+
+                                hazard_label = h["label"].replace(" ", "_").replace("-", "_")
+                                agent_id = f"hazard_{hazard_label}_{side}_{len(merged_agents)}"
+                                distance_weight = 1.0 - hazard_depth
+
+                                new_agent = DetectedAgent(
+                                    agent_id=agent_id,
+                                    class_name=h["label"],
+                                    side=side,
+                                    frame=0,
+                                    seg_score=min(1.0, h.get("confidence", 0.5) * 1.2),
+                                    mode_depth=hazard_depth,
+                                    distance_weight=distance_weight,
+                                    instance_id=-1,
+                                    fused_sides=[side],
+                                    masks={side: hazard_mask},
+                                    was_fused=False,
+                                    mode_flow=None,
+                                    flow_description=None
+                                )
+                                new_agent.hazard_metadata = [{
+                                    "label": h["label"],
+                                    "c_vlm": h.get("c_vlm", 0.0),
+                                    "hazard_type": h.get("hazard_type", "environment_hazard"),
+                                    "description": h.get("description", ""),
+                                    "hazard_confidence": h.get("confidence", 0.0),
+                                    "verified": True
+                                }]
+                                new_agent.hazard_verified = True
+                                new_agent.is_environment_hazard = True
+                                merged_agents.append(new_agent)
+
+                # Log merged agents for first frame (front camera)
+                merger_info = {"num_yoloe_hazards": sum(len(r) for r in yoloe_results_per_side.values()), "num_merged": len(merged_agents)}
+                hazard_logger.log_merged_agents(first_frame, first_depth_map, segmented_agents[0] if segmented_agents else [],
+                    [r for results in yoloe_results_per_side.values() for r in results], merged_agents, merger_info)
+
+                # Stage 4: Propagate hazard masks across frames using optical flow
+                # Get flow estimates between consecutive frames for each side
+                flow_maps = {}
+                if self.video_processor.cubic and hasattr(self, 'flow_maps') and self.flow_maps:
+                    # Use pre-computed flow maps if available
+                    flow_maps = self.flow_maps
+                else:
+                    # Compute flow between consecutive frames for each side
+                    from src.tasks.flow_estimation import predict_flows
+                    for side in camera_sides:
+                        if side in all_camera_frames and len(all_camera_frames[side]) > 1:
+                            side_frames = all_camera_frames[side]
+                            try:
+                                side_flows = predict_flows(side_frames)
+                                flow_maps[side] = side_flows  # List of flow maps (frame_i -> frame_i+1)
+                            except Exception as e:
+                                logger.warning(f"Failed to compute flow for {side}: {e}")
+
+                # Stage 5: Generate per-frame visualizations for ALL frames on ALL sides
+                risk_map_engine = RiskMapEngine()
+                num_frames = max(len(f) for f in all_camera_frames.values()) if all_camera_frames else 0
+
+                # Track per-frame merged agents (propagated masks)
+                frame_merged_agents = [None] * num_frames
+                frame_merged_agents[0] = merged_agents  # First frame uses merged agents from Stage 3
+
+                # Propagate masks to subsequent frames using optical flow
+                for frame_idx in range(1, num_frames):
+                    # Propagate masks from previous frame using optical flow
+                    propagated_agents = self.video_processor._propagate_hazard_masks(frame_merged_agents[frame_idx - 1], frame_idx - 1, frame_idx, flow_maps, all_camera_frames)
+                    frame_merged_agents[frame_idx] = propagated_agents
+
+                # Now generate visualizations for all frames
+                for frame_idx in range(num_frames):
+                    # Get frames for all sides at this frame index
+                    side_frames = {}
+                    side_depth_maps = {}
+                    for side in camera_sides:
+                        if side in all_camera_frames and frame_idx < len(all_camera_frames[side]):
+                            side_frames[side] = all_camera_frames[side][frame_idx]
+                        if side in all_depth_maps and frame_idx < len(all_depth_maps[side]):
+                            side_depth_maps[side] = all_depth_maps[side][frame_idx]
+                        elif side in all_depth_maps and all_depth_maps[side]:
+                            side_depth_maps[side] = all_depth_maps[side][0]
+
+                    # Use front frame as primary for logging
+                    primary_frame = side_frames.get("front", list(side_frames.values())[0] if side_frames else None)
+                    primary_depth = side_depth_maps.get("front", list(side_depth_maps.values())[0] if side_depth_maps else None)
+
+                    if primary_frame is None:
+                        continue
+
+                    # Get merged agents for this frame
+                    current_agents = frame_merged_agents[frame_idx] if frame_merged_agents[frame_idx] else merged_agents
+
+                    # Generate risk map for primary (front) camera
+                    risk_map, hazard_objects = risk_map_engine.generate_risk_map(primary_frame, primary_depth, current_agents)
+
+                    # Create composite visualization showing all camera sides
+                    side_visualizations = []
+                    for side in camera_sides:
+                        if side in side_frames:
+                            side_frame = side_frames[side]
+                            side_depth = side_depth_maps.get(side, primary_depth)
+
+                            # Filter agents that have masks on this side
+                            side_agents = [a for a in current_agents if side in a.masks and a.masks[side] is not None and np.any(a.masks[side])]
+
+                            # Create merged agent visualization for this side
+                            merged_viz = hazard_logger.create_merged_viz(side_frame, side_depth, side_agents)
+
+                            # Create risk map visualization for this side
+                            if side_agents:
+                                side_risk_map, _ = risk_map_engine.generate_risk_map(side_frame, side_depth, side_agents)
+                                risk_viz = visualize_risk_map(side_risk_map, side_frame,
+                                    str(hazard_logger.session_dir / f"risk_map_{side}_{frame_idx:04d}.jpg"))
+                            else:
+                                risk_viz = visualize_risk_map(np.zeros_like(side_depth), side_frame,
+                                    str(hazard_logger.session_dir / f"risk_map_{side}_{frame_idx:04d}.jpg"))
+
+                            # Combine side by side
+                            combined_side = np.hstack([merged_viz, risk_viz])
+                            side_visualizations.append(combined_side)
+
+                    # Combine all sides horizontally
+                    if side_visualizations:
+                        combined_viz = np.hstack(side_visualizations)
+                    else:
+                        combined_viz = np.zeros((480, 1280, 3), dtype=np.uint8)
+
+                    # Log per-frame merged agents (for first few frames)
+                    if frame_idx < 5:
+                        hazard_logger.frame_counter = frame_idx
+                        hazard_logger.log_merged_agents(primary_frame, primary_depth, [],
+                            [r for results in yoloe_results_per_side.values() for r in results], current_agents,
+                            {"frame_idx": frame_idx, "num_merged": len(current_agents)})
+
+                    # Add to video
+                    hazard_logger.add_frame_to_video(combined_viz)
+
+                logger.info(f"Hazard detection complete: {len(hazards)} VLM hazards, {len(merged_agents)} merged agents, {num_frames} frames visualized across {len(camera_sides)} sides")
+
+            except Exception as e:
+                logger.warning(f"Hazard detection pipeline failed: {e}")
+                import traceback
+                traceback.print_exc()
+                merged_agents = segmented_agents[0] if segmented_agents else []
+
+        # Finalize hazard detection video
+        hazard_logger.finalize_video()
+
         static_objects = build_static_objects_summary(environment_items)
         refined_environment_description = self.process_environment_for(
             frames,
@@ -742,6 +1189,7 @@ class SegmentationPipeline:
             epoch_idx=epoch_idx,
             raw_start_frame=raw_start or 0,
             viz_output_dir=viz_output_dir,
+            merged_agents=merged_agents,
         )
 
         return {
@@ -763,10 +1211,11 @@ class SegmentationPipeline:
             depth_masks:     any = None,
             telemetry: Optional[TelemetryData] = None,
             api_base: str = CONFIG["risk_assessment"]["api_base"],
-            model_name: str = CONFIG["risk_assessment"]["model_name"],
+            model_name: Optional[str] = None,
             epoch_idx: Optional[int] = None,
             raw_start_frame: int = 0,
             viz_output_dir: Optional[str] = None,
+            merged_agents: Optional[list] = None,
         ) -> Union[list[dict], dict]:
             """
             Runs G-VEval risk assessment across the batch of frames as an "epoch" window.
@@ -788,6 +1237,7 @@ class SegmentationPipeline:
             Returns:
                 Epoch G-VEval result dict (or list of dicts if sub-epochs are requested).
             """
+            model_name = model_name or CONFIG["risk_assessment"]["model_name"]
             engine = RiskAssessmentEngine(
                 api_base=api_base,
                 model_name=model_name,
@@ -801,6 +1251,7 @@ class SegmentationPipeline:
                 depth_maps=depth_masks,
                 telemetry=telemetry,
                 epoch_id=f"epoch_{epoch_idx}" if epoch_idx is not None else "latest",
+                merged_agents=merged_agents,
             )
 
             # Generate Hazard Visualization Video

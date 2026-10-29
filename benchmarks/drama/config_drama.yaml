@@ -6,6 +6,11 @@ pipeline:
 segmentation:
   min_depth: 0.0  # Set to 0 to ensure very close objects are not filtered
 
+# Optional persistent profile override; otherwise vlm.selected_model from
+# src/tasks/config/config.json is used. CLI --model takes precedence.
+# vlm:
+#   selected_model: cosmos3-nano
+
 risk_assessment:
   danger_zone_threshold: 0.0
   # Use a specific model for the benchmark if needed

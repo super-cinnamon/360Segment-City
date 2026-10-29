@@ -4,6 +4,7 @@ import multiprocessing as mp
 import os
 import sys
 import base64
+import tempfile
 from typing import Optional
 
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
@@ -23,6 +24,7 @@ try:
 except ImportError:
     ollama = None
 import torch
+from openai import OpenAI
 
 from transformers import (
     AutoModelForImageTextToText,
@@ -30,7 +32,7 @@ from transformers import (
     TextIteratorStreamer,
 )
 
-from src.tasks.config.utils import CONFIG, ENV_PROMPT, DEVICE
+from src.tasks.config.utils import CONFIG, ENV_PROMPT, DEVICE, resolve_vlm_profile
 
 is_windows = sys.platform.startswith('win')
 
@@ -60,24 +62,48 @@ def query_ollama_vlm(prompt=ENV_PROMPT, images=[], model=CONFIG["vlm"]["ollama"]
     return response
 
 
-def load_world_model(model=CONFIG["vlm"]["world_model"]["model_name"]):
+def load_world_model(model=None):
     """
-    Loads the world model and caches it by its name to support switching between models.
+    Loads the configured VLM profile and caches it by profile ID.
     """
-    # Load the world model
-    if model in LOADED_MODEL:
-        return LOADED_MODEL[model]
+    profile = resolve_vlm_profile(model)
+    cache_key = profile["id"]
+    if cache_key in LOADED_MODEL:
+        return LOADED_MODEL[cache_key]
 
-    # Use the same Hugging Face-based loading path on Linux as on Windows.
-    world_model_processor = AutoProcessor.from_pretrained(model)
-    world_model = AutoModelForImageTextToText.from_pretrained(
-        model,
-        dtype=torch.bfloat16,
-        attn_implementation="sdpa",
-    ).to(DEVICE)
+    repo_id = profile["repo_id"]
+    if profile["backend"] == "llama.cpp":
+        raise RuntimeError(
+            f"VLM profile '{cache_key}' uses GGUF and must be served by the API's "
+            "llama.cpp backend; it cannot be loaded in-process."
+        )
+
+    if profile["backend"] == "unsloth":
+        try:
+            from unsloth import FastVisionModel
+        except ImportError as exc:
+            raise RuntimeError(
+                "This VLM profile requires Unsloth. Install the optional Unsloth "
+                "runtime in the active environment."
+            ) from exc
+
+        world_model, world_model_processor = FastVisionModel.from_pretrained(
+            model_name=repo_id,
+            **profile.get("load_options", {}),
+        )
+        FastVisionModel.for_inference(world_model)
+    else:
+        world_model_processor = AutoProcessor.from_pretrained(repo_id)
+        world_model = AutoModelForImageTextToText.from_pretrained(
+            repo_id,
+            dtype=torch.bfloat16,
+            attn_implementation="sdpa",
+            **profile.get("load_options", {}),
+        ).to(DEVICE)
+
     world_model.eval()
-    world_model_tokenizer = world_model_processor.tokenizer
-    LOADED_MODEL[model] = (world_model, world_model_processor, world_model_tokenizer)
+    world_model_tokenizer = getattr(world_model_processor, "tokenizer", world_model_processor)
+    LOADED_MODEL[cache_key] = (world_model, world_model_processor, world_model_tokenizer)
 
     return world_model, world_model_processor, world_model_tokenizer
 
@@ -87,8 +113,12 @@ def unload_world_model(model_name: Optional[str] = None):
     """
     global LOADED_MODEL
     if model_name:
-        if model_name in LOADED_MODEL:
-            del LOADED_MODEL[model_name]
+        cache_key = model_name
+        try:
+            cache_key = resolve_vlm_profile(model_name)["id"]
+        except ValueError:
+            pass
+        LOADED_MODEL.pop(cache_key, None)
     else:
         LOADED_MODEL.clear()
 
@@ -99,15 +129,82 @@ def unload_world_model(model_name: Optional[str] = None):
         torch.cuda.empty_cache()
 
 
+def _query_gguf_world_model(prompt, images, video_frames, profile):
+    content = [{"type": "text", "text": prompt}]
+    if video_frames is not None:
+        video_frames = list(video_frames)
+        if video_frames:
+            height, width = video_frames[0].shape[:2]
+            if any(frame.shape[:2] != (height, width) for frame in video_frames):
+                raise ValueError("All video frames must have the same dimensions.")
+
+            descriptor, video_path = tempfile.mkstemp(suffix=".mp4")
+            os.close(descriptor)
+            writer = cv2.VideoWriter(
+                video_path,
+                cv2.VideoWriter_fourcc(*"mp4v"),
+                1.0,
+                (width, height),
+            )
+            if not writer.isOpened():
+                os.unlink(video_path)
+                raise RuntimeError("OpenCV could not create a temporary MP4 for GGUF inference.")
+            try:
+                for frame in video_frames:
+                    writer.write(frame)
+            finally:
+                writer.release()
+            try:
+                with open(video_path, "rb") as video_file:
+                    video_base64 = base64.b64encode(video_file.read()).decode("ascii")
+            finally:
+                os.unlink(video_path)
+            content.append({
+                "type": "video_url",
+                "video_url": {"url": f"data:video/mp4;base64,{video_base64}"},
+            })
+    else:
+        for image in images or []:
+            encoded, buffer = cv2.imencode(".jpg", image)
+            if not encoded:
+                raise RuntimeError("OpenCV could not encode an image for GGUF inference.")
+            image_base64 = base64.b64encode(buffer).decode("ascii")
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"},
+            })
+
+    client = OpenAI(
+        base_url=CONFIG["risk_assessment"]["api_base"],
+        api_key="vllm-local",
+    )
+    response = client.chat.completions.create(
+        model=profile["repo_id"],
+        messages=[{"role": "user", "content": content}],
+        temperature=CONFIG["vlm"]["world_model"]["temperature"],
+        max_tokens=1024,
+    )
+    generated_text = response.choices[0].message.content
+    if not isinstance(generated_text, str):
+        raise RuntimeError(
+            f"GGUF profile '{profile['id']}' returned no text from the local API."
+        )
+    return generated_text
+
+
 # * here we query the world model to describe the environment, we will be adding the segmentation of the static objects in the prompt here, will be completed next time
 def query_world_model(
     prompt=ENV_PROMPT,
     images=None,
-    model=CONFIG["vlm"]["world_model"]["model_name"],
+    model=None,
     video_frames=None,
 ):
     # ! add here the static objects from segmentation
-    # Load the world model
+    profile = resolve_vlm_profile(model)
+    if profile["backend"] == "llama.cpp":
+        return _query_gguf_world_model(prompt, images, video_frames, profile)
+
+    # Load the in-process model
     world_model = load_world_model(model=model)
 
     content = []
@@ -137,6 +234,13 @@ def query_world_model(
     ]
 
     # Query the model
+    processor_kwargs = {}
+    if video_frames is not None and video_frames:
+        video_processor = getattr(world_model[1], "video_processor", None)
+        target_frame_count = getattr(video_processor, "num_frames", None)
+        if target_frame_count is not None and len(video_frames) < target_frame_count:
+            processor_kwargs["num_frames"] = len(video_frames)
+
     inputs = world_model[1].apply_chat_template(
         message,
         tokenize=True,
@@ -144,6 +248,7 @@ def query_world_model(
         return_dict=True,
         return_tensors="pt",
         enable_thinking=False,  # add to config later
+        processor_kwargs=processor_kwargs,
     ).to(DEVICE)
 
     # 1. Generate token output sequence

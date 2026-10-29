@@ -6,13 +6,16 @@ import argparse
 import cv2
 import tempfile
 import shutil
+import copy
+import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any
 import numpy as np
 
 from benchmarks.drama.dataset_loader import DramaLoader, DramaLayout
 from src.process import SegmentationPipeline
-from src.tasks.config.utils import CONFIG
+from src.tasks.config.utils import CONFIG, apply_vlm_profile, resolve_vlm_profile
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
@@ -47,7 +50,12 @@ def create_temp_video(frames_dir: str, clip_id: str) -> str:
     out.release()
     return temp_video_path
 
-def run_benchmark_clip(clip_data: Dict[str, Any], dataset_root: str, config_override: Dict[str, Any]) -> Dict[str, Any]:
+def run_benchmark_clip(
+    clip_data: Dict[str, Any],
+    dataset_root: str,
+    config_override: Dict[str, Any],
+    model_profile: str = None,
+) -> Dict[str, Any]:
     """
     Runs the pipeline on a single DRAMA clip.
     """
@@ -56,6 +64,7 @@ def run_benchmark_clip(clip_data: Dict[str, Any], dataset_root: str, config_over
 
     # 1. Create temporary video
     temp_video_path = None
+    original_config = copy.deepcopy(CONFIG)
     try:
         temp_video_path = create_temp_video(frames_dir, clip_id)
 
@@ -66,6 +75,7 @@ def run_benchmark_clip(clip_data: Dict[str, Any], dataset_root: str, config_over
             if section not in CONFIG:
                 CONFIG[section] = {}
             CONFIG[section].update(values)
+        profile = apply_vlm_profile(model_profile)
 
         # 3. Initialize pipeline and process
         # Use cubic=False because split_panorama=False is handled in SegmentationPipeline.__init__
@@ -86,6 +96,8 @@ def run_benchmark_clip(clip_data: Dict[str, Any], dataset_root: str, config_over
             "environment_description": result.get("environment_description"),
             "segmented_items": result.get("segmented_items"),
             "environment_items": result.get("environment_items"),
+            "model_profile": profile["id"],
+            "model_repo_id": profile["repo_id"],
         }
 
     except Exception as e:
@@ -94,6 +106,8 @@ def run_benchmark_clip(clip_data: Dict[str, Any], dataset_root: str, config_over
     finally:
         if temp_video_path and os.path.exists(temp_video_path):
             os.remove(temp_video_path)
+        CONFIG.clear()
+        CONFIG.update(original_config)
 
 def main():
     parser = argparse.ArgumentParser(description="DRAMA Benchmark Runner")
@@ -102,6 +116,7 @@ def main():
     parser.add_argument("--limit", type=int, help="Limit number of clips")
     parser.add_argument("--validate-dataset", action="store_true", help="Validate dataset and exit")
     parser.add_argument("--output-dir", type=str, default="outputs/drama_results", help="Output directory")
+    parser.add_argument("--model", type=str, help="VLM profile ID from src/tasks/config/config.json (overrides configured selection).")
 
     args = parser.parse_args()
 
@@ -112,7 +127,7 @@ def main():
         try:
             with open(args.config, "r") as f:
                 import yaml
-                cfg = yaml.safe_load(f)
+                cfg = yaml.safe_load(f) or {}
                 root = cfg.get("dataset", {}).get("root")
         except Exception:
             pass
@@ -134,12 +149,18 @@ def main():
     try:
         with open(args.config, "r") as f:
             import yaml
-            config_override = yaml.safe_load(f)
+            config_override = yaml.safe_load(f) or {}
             # Remove dataset root from override to avoid polluting pipeline CONFIG
             if "dataset" in config_override:
                 del config_override["dataset"]
     except Exception as e:
         logger.warning(f"Could not load config override: {e}")
+
+    profile_config = copy.deepcopy(CONFIG)
+    for section, values in config_override.items():
+        profile_config.setdefault(section, {}).update(values)
+    model_profile = args.model or config_override.get("vlm", {}).get("selected_model")
+    profile = resolve_vlm_profile(model_profile, profile_config)
 
     # 4. Load Clips
     annos = loader.load_annotations()
@@ -147,24 +168,40 @@ def main():
         annos = annos[:args.limit]
 
     # 5. Process Clips
-    os.makedirs(args.output_dir, exist_ok=True)
+    run_id = uuid.uuid4().hex
+    run_name = f"{profile['id']}_{run_id}"
+    run_output_dir = Path(args.output_dir) / run_name
+    run_output_dir.mkdir(parents=True, exist_ok=True)
+    with open(run_output_dir / "run_metadata.json", "w", encoding="utf-8") as metadata_file:
+        json.dump({
+            "run_id": run_id,
+            "model_profile": profile["id"],
+            "model_label": profile["label"],
+            "model_repo_id": profile["repo_id"],
+            "model_backend": profile["backend"],
+            "dataset_root": root,
+            "started_at": datetime.now().isoformat(),
+        }, metadata_file, indent=2)
     results = []
 
     for i, clip_data in enumerate(annos):
         logger.info(f"[{i+1}/{len(annos)}] Processing clip {clip_data['clip_id']}...")
-        res = run_benchmark_clip(clip_data, root, config_override)
+        res = run_benchmark_clip(clip_data, root, config_override, model_profile=profile["id"])
+        res["run_id"] = run_id
+        res["model_profile"] = profile["id"]
+        res["model_repo_id"] = profile["repo_id"]
         results.append(res)
 
         # Save per-clip output for resumability
-        with open(os.path.join(args.output_dir, f"{clip_data['clip_id']}.json"), "w") as f:
+        with open(run_output_dir / f"{clip_data['clip_id']}.json", "w") as f:
             json.dump(res, f, indent=2)
 
     # 6. Final summary
-    with open(os.path.join(args.output_dir, "all_results.jsonl"), "w") as f:
+    with open(run_output_dir / "all_results.jsonl", "w") as f:
         for r in results:
             f.write(json.dumps(r) + "\n")
 
-    logger.info(f"Benchmark complete. Results saved to {args.output_dir}")
+    logger.info(f"Benchmark complete. Results saved to {run_output_dir}")
 
 if __name__ == "__main__":
     main()

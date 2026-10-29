@@ -1802,14 +1802,17 @@ class RiskAssessmentEngine:
 
     def __init__(
         self,
-        api_base:   str = _DEFAULT_API_BASE,
-        model_name: str = _DEFAULT_MODEL,
-        n_reasons:  int = _DEFAULT_N,
+        api_base:   Optional[str] = None,
+        model_name: Optional[str] = None,
+        n_reasons:  Optional[int] = None,
     ):
+        api_base = api_base or CONFIG["risk_assessment"]["api_base"]
+        model_name = model_name or CONFIG["risk_assessment"]["model_name"]
+        n_reasons = n_reasons if n_reasons is not None else int(CONFIG["risk_assessment"].get("n_reasons", _DEFAULT_N))
         self.client     = OpenAI(base_url=api_base, api_key="vllm-local")
         self.model_name = model_name
         self.n_reasons  = n_reasons
-        self.risk_map_engine = RiskMapEngine()
+        self.risk_map_engine = RiskMapEngine(model_name=model_name)
 
     def _calculate_agent_risk_values(
         self,
@@ -1822,24 +1825,18 @@ class RiskAssessmentEngine:
         Uses the RiskMapEngine to compute a risk score for each agent based on the spatial risk map.
         Returns a mapping of agent_id -> mean_risk and agent_id -> matched_hazard.
         """
-        # We use the agents' existing masks to generate a risk map that reflects the current scene
-        hazards_data = []
+        # Filter agents that have a valid mask for the given side
+        valid_agents = []
         for a in agents:
             mask = a.masks.get(side)
-            if mask is None or not np.any(mask):
-                continue
-            hazards_data.append({
-                "id": a.agent_id,
-                "mask": mask,
-                "score": a.seg_score,
-                "conf": a.seg_score,
-                "description": f"{a.class_name} agent"
-            })
+            if mask is not None and np.any(mask):
+                valid_agents.append(a)
 
-        if not hazards_data:
+        if not valid_agents:
             return {}, {}
 
-        risk_map, computed_hazards = self.risk_map_engine.generate_risk_map(image, depth_map, hazards_data)
+        # Pass the actual DetectedAgent objects to generate_risk_map (which now expects agents with .masks attribute)
+        risk_map, computed_hazards = self.risk_map_engine.generate_risk_map(image, depth_map, valid_agents)
 
         agent_risks = {}
         agent_hazards = {}
@@ -2389,11 +2386,16 @@ class RiskAssessmentEngine:
         telemetry:       Optional[TelemetryData] = None,
         score_scale:     list[int] = [1, 2, 3, 4, 5],
         epoch_id:        str = "latest",
+        merged_agents:   Optional[list] = None,
     ) -> dict:
         """
         Processes all frames in segmented_items together to capture temporal dynamics.
+
+        Args:
+            merged_agents: Optional pre-merged agents (from hazard detection pipeline).
+                          If provided, these are used instead of building from segmented_items.
         """
-        if not segmented_items:
+        if not segmented_items and not merged_agents:
             return {
                 "expected_risk_score": 1.0,
                 "final_score": 1.0,
@@ -2403,11 +2405,24 @@ class RiskAssessmentEngine:
                 "context_summary": {"frame_count": 0},
             }
 
-        depth_min, depth_max = compute_depth_bounds(segmented_items)
-        epoch_agents = [
-            build_agents_from_segments(frame_segs, depth_min=depth_min, depth_max=depth_max)
-            for frame_segs in segmented_items
-        ]
+        depth_min, depth_max = compute_depth_bounds(segmented_items) if segmented_items else (0.0, 1.0)
+
+        # Use pre-merged agents if provided, otherwise build from segmented_items
+        if merged_agents is not None:
+            # Use merged agents for the first frame (current frame)
+            epoch_agents = [merged_agents]
+            # Also build agents from other frames for temporal context
+            other_agents = [
+                build_agents_from_segments(frame_segs, depth_min=depth_min, depth_max=depth_max)
+                for frame_segs in segmented_items[1:]
+            ]
+            epoch_agents.extend(other_agents)
+        else:
+            epoch_agents = [
+                build_agents_from_segments(frame_segs, depth_min=depth_min, depth_max=depth_max)
+                for frame_segs in segmented_items
+            ]
+
         all_agents_flat = [a for frame in epoch_agents for a in frame]
         recent_track_context = {}
         for frame_segments in segmented_items:
@@ -2578,7 +2593,10 @@ class RiskAssessmentEngine:
                         agent_risks.update(risks)
                         agent_hazards.update(hazards)
             else:
-                risks, hazards = self._calculate_agent_risk_values(agents, frames, depth_map)
+                # Single front frame case
+                img = frames[0] if isinstance(frames, list) else frames
+                dmap = depth_map[0] if isinstance(depth_map, list) else depth_map
+                risks, hazards = self._calculate_agent_risk_values(agents, img, dmap, side="front")
                 agent_risks.update(risks)
                 agent_hazards.update(hazards)
 

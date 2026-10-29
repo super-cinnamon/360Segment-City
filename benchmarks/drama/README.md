@@ -23,6 +23,22 @@ Process the clips and generate risk assessments:
 python3 -m benchmarks.drama.runner --dataset-root /path/to/drama --config benchmarks/drama/config_drama.yaml --output-dir outputs/drama_results
 ```
 
+The selected profile defaults to `vlm.selected_model` in
+`src/tasks/config/config.json`. A run-specific selection can be supplied with
+`--model`; for example:
+
+```bash
+python3 -m benchmarks.drama.runner --dataset-root /path/to/drama --model cosmos3-nano
+```
+
+The config file may also set `vlm.selected_model`; the CLI option takes
+precedence for that run. Each invocation writes to
+`outputs/drama_results/<profile>_<uuid>/`, including per-clip JSON,
+`all_results.jsonl`, and `run_metadata.json`. Candidate profiles must have a
+valid `repo_id` and verified video support in the central model registry before
+they can run. Unsloth-backed profiles require Unsloth installed in the active
+PyTorch/CUDA environment.
+
 ### 3. Extract & Evaluate
 (Note: The adapter currently needs to be integrated into the evaluation flow)
 Run the evaluation script to get metrics:

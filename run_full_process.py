@@ -2,6 +2,10 @@ import sys
 import os
 import argparse
 import logging
+import subprocess
+from datetime import datetime
+from pathlib import Path
+import uuid
 
 # Initialize logger for the script
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -31,12 +35,10 @@ import cv2
 from src.process import SegmentationPipeline
 from src.tasks.api.api_run import start_api_in_background
 from src.tasks.environment import query_world_model
-from src.tasks.config.utils import ENV_PROMPT, CONFIG
+from src.tasks.config.utils import ENV_PROMPT, CONFIG, apply_vlm_profile
 
 DATA_PATH = "data/GS020012_last30s.mp4"
 OUTPUT_DIR = "data/outputs"
-DETAILED_OUT = os.path.join(OUTPUT_DIR, "paper_risk_epochs_detailed.jsonl")
-SUMMARY_OUT = os.path.join(OUTPUT_DIR, "paper_risk_epochs_summary.jsonl")
 
 
 def ensure_out_dir():
@@ -85,16 +87,40 @@ def merge_hazard_videos(video_paths, output_path):
     out.release()
     print(f"Successfully merged hazard video: {output_path}", flush=True)
 
-def run_full_pipeline(sample_dir="data/sample_1"):
+def run_full_pipeline(sample_dir="data/sample_1", model_profile=None):
     """
     Runs the full risk assessment pipeline for a given directory.
     Expects '360_video.mp4' and telemetry CSVs in the directory.
     """
-    print(f"Starting full pipeline for directory: {sample_dir}", flush=True)
+    sample_path = Path(sample_dir).resolve()
+    sample_name = sample_path.name
+    profile = apply_vlm_profile(model_profile)
+    run_id = uuid.uuid4().hex
+    run_name = f"{profile['id']}_{run_id}"
+    run_output_dir = Path(OUTPUT_DIR) / sample_name / run_name
+    viz_output_dir = Path("outputs/risk_viz") / sample_name / run_name
+    run_output_dir.mkdir(parents=True, exist_ok=True)
+    viz_output_dir.mkdir(parents=True, exist_ok=True)
+    detailed_out = run_output_dir / "paper_risk_epochs_detailed.jsonl"
+    summary_out = run_output_dir / "paper_risk_epochs_summary.jsonl"
+    source_video = sample_path / "360_video.mp4"
+    run_metadata = {
+        "run_id": run_id,
+        "model_profile": profile["id"],
+        "model_label": profile["label"],
+        "model_repo_id": profile["repo_id"],
+        "model_backend": profile["backend"],
+        "sample_dir": str(sample_path),
+        "started_at": datetime.now().isoformat(),
+    }
+    with open(run_output_dir / "run_metadata.json", "w", encoding="utf-8") as metadata_file:
+        json.dump(run_metadata, metadata_file, indent=2)
+
+    print(f"Starting full pipeline for directory: {sample_path}", flush=True)
 
     # Initialize pipeline with directory path. This automatically triggers TelemetryProcessor
     # initialization if the directory contains valid GPMF CSVs.
-    pipeline = SegmentationPipeline(sample_dir, cubic=True)
+    pipeline = SegmentationPipeline(str(sample_path), cubic=True)
 
     epoch_size = CONFIG["risk_assessment"].get("epoch_window_size", 60)
     chunk_max_frames = epoch_size * 5
@@ -127,6 +153,7 @@ def run_full_pipeline(sample_dir="data/sample_1"):
                 raw_start=actual_start,
                 raw_end=actual_end,
                 force_process=force_current_epoch,
+                viz_output_dir=str(viz_output_dir.resolve()),
             )
             force_next_epoch = bool(
                 result["processed"] and result.get("roi_triggered", False)
@@ -136,18 +163,21 @@ def run_full_pipeline(sample_dir="data/sample_1"):
                 "epoch_idx": epoch_idx,
                 "raw_start": actual_start,
                 "raw_end": actual_end,
+                "run_id": run_id,
+                "model_profile": profile["id"],
+                "model_repo_id": profile["repo_id"],
             }
 
             if result["processed"]:
                 res = result["risk_result"]
-                save_jsonl(DETAILED_OUT, {"meta": meta, "result": res})
-                save_jsonl(SUMMARY_OUT, {"meta": meta, "final_score": res.get("final_score", res.get("expected_risk_score", None))})
+                save_jsonl(detailed_out, {"meta": meta, "result": res})
+                save_jsonl(summary_out, {"meta": meta, "final_score": res.get("final_score", res.get("expected_risk_score", None))})
                 if "viz_video_path" in res:
                     viz_videos.append(res["viz_video_path"])
             else:
                 # Log why the epoch was skipped (e.g., ROI gating)
                 logger.info(f"Epoch {epoch_idx} skipped: {result['reason']}")
-                save_jsonl(DETAILED_OUT, {"meta": meta, "result": {"processed": False, "reason": result["reason"]}})
+                save_jsonl(detailed_out, {"meta": meta, "result": {"processed": False, "reason": result["reason"]}})
 
             pipeline.cleanup_gpu()
             epoch_idx += 1
@@ -157,13 +187,32 @@ def run_full_pipeline(sample_dir="data/sample_1"):
         if last_raw is None: break
         start_raw = last_raw + 1
 
-    merge_hazard_videos(viz_videos, "outputs/risk_viz/hazard_viz_full.mp4")
-    print(f"Processing complete for {sample_dir}. Results saved to {OUTPUT_DIR}.", flush=True)
+    merge_hazard_videos(viz_videos, str(viz_output_dir / "hazard_viz_full.mp4"))
+
+    final_video = viz_output_dir / "hazard_analysis_full.mp4"
+    render_command = [
+        sys.executable,
+        "scripts/render_hazard_video.py",
+        "--video", str(source_video),
+        "--risk-data", str(detailed_out),
+        "--telemetry-dir", str(sample_path),
+        "--sidecar-dir", str(viz_output_dir.resolve()),
+        "--output", str(final_video),
+        "--mask-threshold", "0",
+    ]
+    print("Generating final hazard analysis video...", flush=True)
+    subprocess.run(render_command, check=True)
+    print(
+        f"Processing complete for {sample_path}. Results: {run_output_dir}; "
+        f"final video: {final_video}",
+        flush=True,
+    )
 
 def main():
     parser = argparse.ArgumentParser(description="Run the full panoptic perception and risk assessment pipeline.")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging to see fragment merging details.")
     parser.add_argument("--sample_dir", type=str, default="data/sample_1", help="Directory containing video and telemetry.")
+    parser.add_argument("--model", type=str, help="VLM profile ID from src/tasks/config/config.json (overrides vlm.selected_model for this run).")
     args = parser.parse_args()
 
     if args.debug:
@@ -173,10 +222,12 @@ def main():
 
     ensure_out_dir()
 
+    profile = apply_vlm_profile(args.model)
+    print(f"Starting VLM profile: {profile['id']} ({profile['repo_id']})", flush=True)
     print("DEBUG: Starting API server...", flush=True)
-    start_api_in_background()
+    start_api_in_background(model_name=profile["repo_id"])
 
-    run_full_pipeline(sample_dir=args.sample_dir)
+    run_full_pipeline(sample_dir=args.sample_dir, model_profile=profile["id"])
 
 if __name__ == "__main__":
     main()
