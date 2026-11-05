@@ -99,7 +99,7 @@
                 "model_file": "NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-UD-Q4_K_M.gguf",
                 "mmproj_file": "mmproj-F16.gguf",
                 "server_port": 5016,
-                "context_size": 8192,
+                "context_size": 262144,
                 "supports_video": true,
                 "download_patterns": [
                     "NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-UD-Q4_K_M.gguf",
@@ -117,10 +117,34 @@
             },
             "gemma-4-26b-a4b": {
                 "label": "Gemma 4 26B A4B",
-                "repo_id": "unsloth/gemma-4-26B-A4B-it-NVFP4",
-                "backend": "unsloth",
+                "repo_id": "unsloth/gemma-4-26B-A4B-it-GGUF",
+                "backend": "llama.cpp",
+                "artifact_format": "gguf",
+                "model_file": "gemma-4-26B-A4B-it-UD-Q4_K_M.gguf",
+                "mmproj_file": "mmproj-F16.gguf",
+                "server_port": 5017,
+                "context_size": 262144,
                 "supports_video": true,
-                "quantization": "nvfp4",
+                "download_patterns": [
+                    "gemma-4-26B-A4B-it-UD-Q4_K_M.gguf",
+                    "mmproj-F16.gguf"
+                ],
+                "load_options": {}
+            },
+            "gemma-4-e4b": {
+                "label": "Gemma 4 E4B",
+                "repo_id": "unsloth/gemma-4-E4B-it-GGUF",
+                "backend": "llama.cpp",
+                "artifact_format": "gguf",
+                "model_file": "gemma-4-E4B-it-Q4_K_M.gguf",
+                "mmproj_file": "mmproj-F16.gguf",
+                "server_port": 5018,
+                "context_size": 131072,
+                "supports_video": true,
+                "download_patterns": [
+                    "gemma-4-E4B-it-Q4_K_M.gguf",
+                    "mmproj-F16.gguf"
+                ],
                 "load_options": {}
             }
         },
@@ -129,7 +153,7 @@
             "temperature": 0.7
         },
         "world_model": {
-            "model_name": "nvidia/Cosmos3-Nano",
+            "model_name": "gemma-4-26b-a4b",
             "temperature": 0.5
         }
     },
@@ -148,7 +172,6 @@
     },
     "risk_assessment": {
         "api_base": "http://localhost:5015/v1",
-        "model_name": "nvidia/Cosmos3-Nano",
         "epoch_window_size": 30,
         "n_reasons": 10,
         "normalize_scores": true,
@@ -156,7 +179,6 @@
         "softmax_temperature": 0.7
     },
     "risk_map": {
-        "model_name": "nvidia/Cosmos3-Nano",
         "weights": {
             "vlm": 0.4,
             "area": 0.2,

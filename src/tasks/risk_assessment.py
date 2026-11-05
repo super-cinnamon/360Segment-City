@@ -59,7 +59,7 @@ DEBUG_WM_DIR.mkdir(parents=True, exist_ok=True)
 # ---------------------------------------------------------------------------
 _RA_CFG           = CONFIG["risk_assessment"]
 _DEFAULT_API_BASE = _RA_CFG["api_base"]
-_DEFAULT_MODEL    = _RA_CFG["model_name"]
+_DEFAULT_MODEL    = _RA_CFG.get("model_name", "nvidia/Cosmos3-Nano")
 _DEFAULT_N        = int(_RA_CFG.get("n_reasons", 5))
 _NORMALIZE_SCORES = _RA_CFG.get("normalize_scores", True)
 _SOFTMAX_TEMP     = float(_RA_CFG.get("softmax_temperature", 0.7))
@@ -455,9 +455,40 @@ def _build_epoch_scene_block(
     if include_multimodal:
         # Generate the composite once for the initial WM payload.
         try:
-            composite_video_b64 = _generate_epoch_composite_video(top_instance_ids, epoch_agents, frames)
-            if composite_video_b64:
-                multimodal_content.append({"type": "video", "content": composite_video_b64, "description": "Composite epoch view"})
+            # For gemma-4-26b-a4b, we provide a sequence of key frames instead of a single video
+            # to ensure compatibility across different backends that may handle video_url differently.
+            if "gemma-4-26b-a4b" in (CONFIG["risk_assessment"].get("model_name", "") or ""):
+                # Sample 8 key frames from the epoch
+                sampled_frames = []
+                num_frames = len(epoch_agents)
+                indices = np.linspace(0, num_frames - 1, 8, dtype=int)
+
+                # We need to build a composite for each sampled frame
+                for idx in indices:
+                    available_sides = []
+                    if isinstance(frames, dict):
+                        available_sides = [s for s in ('left', 'front', 'right', 'back') if s in frames]
+                    elif frames is not None:
+                        available_sides = ['front']
+
+                    side_imgs = []
+                    for side in available_sides:
+                        img = frames[side][idx] if isinstance(frames, dict) else frames[idx]
+                        side_imgs.append(img)
+
+                    composite_img = np.hstack(side_imgs)
+
+                    _, buffer = cv2.imencode(".jpg", composite_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                    sampled_frames.append({
+                        "type": "image",
+                        "content": base64.b64encode(buffer).decode("utf-8"),
+                        "description": f"Epoch frame {idx}"
+                    })
+                multimodal_content.extend(sampled_frames)
+            else:
+                composite_video_b64 = _generate_epoch_composite_video(top_instance_ids, epoch_agents, frames)
+                if composite_video_b64:
+                    multimodal_content.append({"type": "video", "content": composite_video_b64, "description": "Composite epoch view"})
         except Exception as e:
             logger.warning("Failed to generate composite video, falling back to per-agent videos: %s", e)
             for iid in top_instance_ids:

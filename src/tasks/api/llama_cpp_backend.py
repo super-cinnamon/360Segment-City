@@ -79,6 +79,7 @@ def start_llama_cpp_server(profile: dict) -> str:
         "--host", "127.0.0.1",
         "--port", str(port),
         "--ctx-size", str(profile.get("context_size", 8192)),
+        "--log-disable",
     ]
     process = subprocess.Popen(command)
     _SERVERS[profile_id] = (process, base_url)

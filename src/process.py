@@ -733,9 +733,13 @@ class SegmentationPipeline:
             prepared_frames = self._prepare_frames_for_inference(frames)
 
         if self.video_processor.cubic:
-            front_frames = prepared_frames["front"]
+            # Combine frames from all enabled views to give the model a full 360-degree context
+            all_view_frames = []
+            for side in self.enabled_views:
+                if side in prepared_frames:
+                    all_view_frames.extend(prepared_frames[side])
         else:
-            front_frames = prepared_frames
+            all_view_frames = prepared_frames
 
         # add static objects to prompt
         static_objects_summary = static_objects if static_objects is not None else []
@@ -744,11 +748,11 @@ class SegmentationPipeline:
             static_objects=static_objects_summary,
         )
 
-        # Query the world model using all frames in the epoch as a video sequence
+        # Query the world model using frames from all views as a sequence
         # This provides a comprehensive environment description for ROI gating.
         env_description = query_world_model(
             prompt=resolved_prompt,
-            video_frames=front_frames,
+            video_frames=all_view_frames,
             model=CONFIG["vlm"]["world_model"]["model_name"],
         )
 
@@ -1061,9 +1065,18 @@ class SegmentationPipeline:
                 hazard_logger.log_merged_agents(first_frame, first_depth_map, segmented_agents[0] if segmented_agents else [],
                     [r for results in yoloe_results_per_side.values() for r in results], merged_agents, merger_info)
 
-                # Stage 4: Propagate hazard masks across frames using optical flow
-                # Get flow estimates between consecutive frames for each side
-                flow_maps = {}
+                # Stage 4: Associate hazard metadata from first frame with all agents across the epoch
+                # instead of propagating masks via optical flow (which can lead to static masks).
+                hazard_meta_map = {
+                    a.agent_id: {
+                        "metadata": getattr(a, 'hazard_metadata', None),
+                        "verified": getattr(a, 'hazard_verified', False),
+                        "is_env": getattr(a, 'is_environment_hazard', False),
+                    }
+                    for a in merged_agents
+                }
+
+                # Stage 5: Generate per-frame visualizations for ALL frames on ALL sides (V2)
                 if self.video_processor.cubic and hasattr(self, 'flow_maps') and self.flow_maps:
                     # Use pre-computed flow maps if available
                     flow_maps = self.flow_maps
@@ -1079,19 +1092,16 @@ class SegmentationPipeline:
                             except Exception as e:
                                 logger.warning(f"Failed to compute flow for {side}: {e}")
 
-                # Stage 5: Generate per-frame visualizations for ALL frames on ALL sides
+                # Stage 5: Generate per-frame visualizations for ALL frames on ALL sides (V2)
                 risk_map_engine = RiskMapEngine()
                 num_frames = max(len(f) for f in all_camera_frames.values()) if all_camera_frames else 0
 
                 # Track per-frame merged agents (propagated masks)
-                frame_merged_agents = [None] * num_frames
-                frame_merged_agents[0] = merged_agents  # First frame uses merged agents from Stage 3
+                # Frame-merged agents are now handled inside the loop
+                # Metadata mapping handles the base hazards
 
                 # Propagate masks to subsequent frames using optical flow
-                for frame_idx in range(1, num_frames):
-                    # Propagate masks from previous frame using optical flow
-                    propagated_agents = self.video_processor._propagate_hazard_masks(frame_merged_agents[frame_idx - 1], frame_idx - 1, frame_idx, flow_maps, all_camera_frames)
-                    frame_merged_agents[frame_idx] = propagated_agents
+                # Propagation loop removed to fix static mask issue
 
                 # Now generate visualizations for all frames
                 for frame_idx in range(num_frames):
@@ -1113,8 +1123,24 @@ class SegmentationPipeline:
                     if primary_frame is None:
                         continue
 
-                    # Get merged agents for this frame
-                    current_agents = frame_merged_agents[frame_idx] if frame_merged_agents[frame_idx] else merged_agents
+                    # Use actual segmented agents for this frame and enrich with metadata from frame 0
+                    current_agents = segmented_agents[frame_idx] if frame_idx < len(segmented_agents) else []
+                    enriched_agents = []
+                    for agent in current_agents:
+                        if agent.agent_id in hazard_meta_map:
+                            meta = hazard_meta_map[agent.agent_id]
+                            agent.hazard_metadata = meta["metadata"]
+                            agent.hazard_verified = meta["verified"]
+                            agent.is_environment_hazard = meta["is_env"]
+                        enriched_agents.append(agent)
+
+                    # Also include environment hazards from frame 0 that might not be in current segmentation
+                    # but should remain as static risk zones.
+                    for m_agent in merged_agents:
+                        if m_agent.is_environment_hazard and m_agent.agent_id not in [a.agent_id for a in enriched_agents]:
+                            enriched_agents.append(m_agent)
+
+                    current_agents = enriched_agents
 
                     # Generate risk map for primary (front) camera
                     risk_map, hazard_objects = risk_map_engine.generate_risk_map(primary_frame, primary_depth, current_agents)

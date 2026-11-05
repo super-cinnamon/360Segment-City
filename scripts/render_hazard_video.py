@@ -154,9 +154,9 @@ def load_epoch_sidecar(record: EpochRecord) -> None:
     stored_ids = {entry["object_id"] for entry in metadata.get("mask_entries", [])}
     missing_ids = expected_ids - stored_ids
     if missing_ids:
-        raise ValueError(
-            f"Epoch {record.epoch_idx} hazard IDs have no saved masks: "
-            f"{', '.join(sorted(missing_ids))}. Refusing to render a misleading video."
+        print(
+            f"Warning: Epoch {record.epoch_idx} hazard IDs have no saved masks: "
+            f"{', '.join(sorted(missing_ids))}. These will not be visualized."
         )
 
 

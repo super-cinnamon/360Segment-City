@@ -74,6 +74,20 @@ def _extract_environment_risk_score(description: Optional[str]) -> Optional[floa
     return None
 
 
+def _has_structured_risk_score(description: Optional[str]) -> bool:
+    if isinstance(description, dict):
+        parsed = description
+    elif isinstance(description, str):
+        try:
+            parsed = json.loads(description)
+        except (TypeError, ValueError):
+            return False
+    else:
+        return False
+
+    return isinstance(parsed, dict) and _extract_environment_risk_score(parsed) is not None
+
+
 def compute_roi_score(description: Optional[str]) -> Tuple[float, list[str]]:
     """Score the likelihood that the environment description represents a high-risk ROI."""
     cleaned = _normalize_text(description)
@@ -133,6 +147,17 @@ def should_process_window(
     roi_threshold: float = 0.75,
 ) -> bool:
     if not roi_enabled:
+        return True
+    if description is None or not description.strip():
+        logger.warning(
+            "ROI description is empty; processing window because risk could not be assessed."
+        )
+        return True
+    if not _has_structured_risk_score(description):
+        logger.warning(
+            "ROI description has no structured risk score; processing window because "
+            "risk could not be assessed."
+        )
         return True
     score, matched = compute_roi_score(description)
     decision = score >= roi_threshold

@@ -4,8 +4,12 @@ import multiprocessing as mp
 import os
 import sys
 import base64
+import logging
 import tempfile
 from typing import Optional
+import cv2
+import numpy as np
+from PIL import Image
 
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
@@ -13,10 +17,6 @@ try:
     mp.set_start_method("spawn", force=True)
 except RuntimeError:
     pass
-
-import cv2
-import numpy as np
-from PIL import Image
 
 from matplotlib import image
 try:
@@ -34,6 +34,7 @@ from transformers import (
 
 from src.tasks.config.utils import CONFIG, ENV_PROMPT, DEVICE, resolve_vlm_profile
 
+logger = logging.getLogger(__name__)
 is_windows = sys.platform.startswith('win')
 
 # vLLM path kept commented out; using the same Hugging Face workflow on Linux too.
@@ -50,7 +51,6 @@ def query_ollama_vlm(prompt=ENV_PROMPT, images=[], model=CONFIG["vlm"]["ollama"]
         _, buffer = cv2.imencode('.jpg', image)
         image_base64 = base64.b64encode(buffer).decode('utf-8')
         image_bytes.append(image_base64)
-
 
     # Query the model
     response =ollama.generate(
@@ -131,39 +131,22 @@ def unload_world_model(model_name: Optional[str] = None):
 
 def _query_gguf_world_model(prompt, images, video_frames, profile):
     content = [{"type": "text", "text": prompt}]
+
+    # Handle video frames by sending them as a sequence of images
+    # llama-server does not support native video_url/MP4 input
     if video_frames is not None:
         video_frames = list(video_frames)
         if video_frames:
-            height, width = video_frames[0].shape[:2]
-            if any(frame.shape[:2] != (height, width) for frame in video_frames):
-                raise ValueError("All video frames must have the same dimensions.")
-
-            descriptor, video_path = tempfile.mkstemp(suffix=".mp4")
-            os.close(descriptor)
-            writer = cv2.VideoWriter(
-                video_path,
-                cv2.VideoWriter_fourcc(*"mp4v"),
-                1.0,
-                (width, height),
-            )
-            if not writer.isOpened():
-                os.unlink(video_path)
-                raise RuntimeError("OpenCV could not create a temporary MP4 for GGUF inference.")
-            try:
-                for frame in video_frames:
-                    writer.write(frame)
-            finally:
-                writer.release()
-            try:
-                with open(video_path, "rb") as video_file:
-                    video_base64 = base64.b64encode(video_file.read()).decode("ascii")
-            finally:
-                os.unlink(video_path)
-            content.append({
-                "type": "video_url",
-                "video_url": {"url": f"data:video/mp4;base64,{video_base64}"},
-            })
-    else:
+            for frame in video_frames:
+                encoded, buffer = cv2.imencode(".jpg", frame)
+                if not encoded:
+                    continue
+                image_base64 = base64.b64encode(buffer).decode("ascii")
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"},
+                })
+    elif images:
         for image in images or []:
             encoded, buffer = cv2.imencode(".jpg", image)
             if not encoded:
@@ -184,10 +167,22 @@ def _query_gguf_world_model(prompt, images, video_frames, profile):
         temperature=CONFIG["vlm"]["world_model"]["temperature"],
         max_tokens=1024,
     )
-    generated_text = response.choices[0].message.content
+    choice = response.choices[0]
+    message = choice.message
+    generated_text = message.content
     if not isinstance(generated_text, str):
         raise RuntimeError(
-            f"GGUF profile '{profile['id']}' returned no text from the local API."
+            f"GGUF profile '{profile['id']}' returned no text from the local API "
+            f"(finish_reason={choice.finish_reason!r})."
+        )
+    if not generated_text.strip():
+        reasoning = getattr(message, "reasoning_content", None)
+        logger.warning(
+            "GGUF profile '%s' returned empty assistant content "
+            "(finish_reason=%r, reasoning_chars=%d).",
+            profile["id"],
+            choice.finish_reason,
+            len(reasoning) if isinstance(reasoning, str) else 0,
         )
     return generated_text
 
@@ -267,7 +262,7 @@ def query_world_model(
     # 3. Decode the token IDs back into string output
     response = world_model[1].decode(
         new_tokens,
-        skip_special_tokens=True
+        skip_special_tokens=True,
     )
 
     # Explicitly delete GPU tensors to prevent memory leaks

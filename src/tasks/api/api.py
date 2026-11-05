@@ -44,8 +44,8 @@ class ChatCompletionRequest(BaseModel):
     messages: List[ChatMessage]
     temperature: Optional[float] = 0.5
     max_tokens: Optional[int] = 1024
-    logprobs: Optional[bool] = False
-    top_logprobs: Optional[int] = 10
+    logprobs: Optional[bool] = None
+    top_logprobs: Optional[int] = None
 
 
 @contextmanager

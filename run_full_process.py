@@ -101,8 +101,8 @@ def run_full_pipeline(sample_dir="data/sample_1", model_profile=None):
     viz_output_dir = Path("outputs/risk_viz") / sample_name / run_name
     run_output_dir.mkdir(parents=True, exist_ok=True)
     viz_output_dir.mkdir(parents=True, exist_ok=True)
-    detailed_out = run_output_dir / "paper_risk_epochs_detailed.jsonl"
-    summary_out = run_output_dir / "paper_risk_epochs_summary.jsonl"
+    detailed_out = viz_output_dir / f"logs_{profile['id']}_{run_id}.jsonl"
+    summary_out = viz_output_dir / f"summary_{profile['id']}_{run_id}.jsonl"
     source_video = sample_path / "360_video.mp4"
     run_metadata = {
         "run_id": run_id,

@@ -75,20 +75,23 @@ Add `--debug` for debug-level logging. The runner starts the local API on
 initialization delay and may take substantial time depending on video length,
 hardware, and model choices.
 
-The full runner creates a timestamped run folder to keep its risk records and
-mask sidecars aligned. It automatically renders the final analysis video after
-the framework finishes. For a sample directory named `sample_1`, outputs are:
+The full runner creates a unique run folder named
+`<model>_<uuid>` to keep its risk records and mask sidecars aligned. It
+automatically renders the final analysis video after the framework finishes.
+For a sample directory named `sample_1`, outputs are:
 
-- `data/outputs/sample_1/<run_id>/paper_risk_epochs_detailed.jsonl` — per-epoch
-  results and skip reasons.
-- `data/outputs/sample_1/<run_id>/paper_risk_epochs_summary.jsonl` — per-epoch
-  final risk scores.
-- `outputs/risk_viz/sample_1/<run_id>/hazard_viz_<epoch>.npz` — the masks and
+- `outputs/risk_viz/sample_1/<model>_<uuid>/logs_<model>_<uuid>.jsonl` —
+  per-epoch results and skip reasons.
+- `outputs/risk_viz/sample_1/<model>_<uuid>/summary_<model>_<uuid>.jsonl` —
+  per-epoch final risk scores.
+- `outputs/risk_viz/sample_1/<model>_<uuid>/hazard_viz_<epoch>.npz` — the masks and
   metadata corresponding to that exact run's hazard IDs.
-- `outputs/risk_viz/sample_1/<run_id>/hazard_analysis_full.mp4` — automatically
+- `outputs/risk_viz/sample_1/<model>_<uuid>/hazard_analysis_full.mp4` — automatically
   rendered full source video with telemetry and hazard overlays.
-- `outputs/risk_viz/sample_1/<run_id>/hazard_viz_full.mp4` — merged per-epoch
+- `outputs/risk_viz/sample_1/<model>_<uuid>/hazard_viz_full.mp4` — merged per-epoch
   visualization clips.
+- `data/outputs/sample_1/<model>_<uuid>/run_metadata.json` — run and model
+  metadata.
 
 Each run gets a new unique folder, so older logs and masks are not reused or
 overwritten.
@@ -99,10 +102,10 @@ hazard overlays/reasons below it, run the independent compositor after processin
 ```bash
 python scripts/render_hazard_video.py \
   --video data/sample_1/360_video.mp4 \
-  --risk-data data/outputs/sample_1/<run_id>/paper_risk_epochs_detailed.jsonl \
-  --sidecar-dir outputs/risk_viz/sample_1/<run_id> \
+  --risk-data outputs/risk_viz/sample_1/<model>_<uuid>/logs_<model>_<uuid>.jsonl \
+  --sidecar-dir outputs/risk_viz/sample_1/<model>_<uuid> \
   --telemetry-dir data/sample_1 \
-  --output outputs/risk_viz/sample_1/<run_id>/hazard_analysis_full.mp4 \
+  --output outputs/risk_viz/sample_1/<model>_<uuid>/hazard_analysis_full.mp4 \
   --mask-threshold 0
 ```
 
@@ -144,19 +147,21 @@ available for quick switching.
 Each profile declares a `repo_id`, `backend`, and video capability. Set a
 candidate's exact Hugging Face repository in `repo_id` and verify that the
 checkpoint accepts the pipeline's video inputs before setting
-`supports_video` to `true`. Qwen 3.8 and both Gemma 4 profiles use the
-in-process Unsloth `FastVisionModel` loader. Nemotron 3 Nano Omni is a GGUF
-profile served by a separate `llama-server` process; install a llama.cpp build
-with multimodal support and make `llama-server` available on `PATH` before
-selecting it. Download its configured model and projector files with:
+`supports_video` to `true`. Qwen 3.8 and Gemma 4 12B use the in-process Unsloth `FastVisionModel` loader.
+Nemotron 3 Nano Omni, Gemma 4 26B A4B, and Gemma 4 E4B are GGUF profiles served
+by a separate `llama-server` process; install a llama.cpp build with
+multimodal support and make `llama-server` available on `PATH` before selecting
+one. Download their configured model and projector files with:
 
 ```bash
 python scripts/download_vlm_models.py --model nemotron-3-nano-omni-30b-a3b-reasoning
+python scripts/download_vlm_models.py --model gemma-4-26b-a4b
+python scripts/download_vlm_models.py --model gemma-4-e4b
 ```
 
-The local API starts the GGUF server only when that profile is selected. Other
-profiles continue to use their configured in-process backend. The text-only
-Nemotron Bolt model is not in the selectable catalog.
+The local API starts the corresponding GGUF server only when that profile is
+selected. Other profiles continue to use their configured in-process backend.
+The text-only Nemotron Bolt model is not in the selectable catalog.
 Profiles using the `unsloth` backend load Unsloth lazily; install its runtime
 for the active PyTorch/CUDA environment before selecting them. The Cosmos
 profile uses Transformers and does not require Unsloth.
@@ -181,10 +186,10 @@ python scripts/download_vlm_models.py
 python scripts/download_vlm_models.py --model gemma-4-26b-a4b --cache-dir /path/to/hf-cache
 ```
 
-The Nano Omni profile downloads only its Q4_K_M GGUF and F16 vision projector,
-not every quantization in the upstream repository. GGUF inference still
-requires a compatible serving backend; the current local Transformers/Unsloth
-loader reports this profile as unsupported for pipeline inference.
+Each GGUF profile downloads only its configured model and F16 vision projector,
+not every quantization in the upstream repository. GGUF inference uses the
+configured llama.cpp server rather than the in-process Transformers/Unsloth
+loader.
 
 ## Depth estimation
 
