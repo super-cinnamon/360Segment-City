@@ -12,6 +12,17 @@ from src.tasks.config.utils import CONFIG, DEVICE
 _segmentation_processor = None
 _segmentation_model = None
 
+def unload_model():
+    global _segmentation_processor, _segmentation_model
+    _segmentation_processor = None
+    _segmentation_model = None
+    import torch
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 
 def _ensure_segmentation_model():
     """Load the segmentation model and processor on first use."""

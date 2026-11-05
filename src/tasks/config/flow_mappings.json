@@ -1,0 +1,26 @@
+{
+  "front": {
+    "u_pos": "right",
+    "u_neg": "left",
+    "v_pos": "down",
+    "v_neg": "up"
+  },
+  "left": {
+    "u_pos": "forward",
+    "u_neg": "backward",
+    "v_pos": "down",
+    "v_neg": "up"
+  },
+  "right": {
+    "u_pos": "backward",
+    "u_neg": "forward",
+    "v_pos": "down",
+    "v_neg": "up"
+  },
+  "back": {
+    "u_pos": "left",
+    "u_neg": "right",
+    "v_pos": "down",
+    "v_neg": "up"
+  }
+}

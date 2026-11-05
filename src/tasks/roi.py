@@ -1,7 +1,11 @@
 import json
 import re
+import logging
 from collections import Counter
 from typing import Iterable, Optional, Sequence, Tuple
+
+logger = logging.getLogger(__name__)
+
 
 import cv2
 import numpy as np
@@ -25,7 +29,6 @@ ROI_KEYWORDS: list[tuple[str, float]] = [
     ("crowded", 0.7),
     ("congestion", 0.7),
 ]
-
 
 def _normalize_text(text: Optional[str]) -> str:
     if not text:
@@ -71,10 +74,25 @@ def _extract_environment_risk_score(description: Optional[str]) -> Optional[floa
     return None
 
 
+def _has_structured_risk_score(description: Optional[str]) -> bool:
+    if isinstance(description, dict):
+        parsed = description
+    elif isinstance(description, str):
+        try:
+            parsed = json.loads(description)
+        except (TypeError, ValueError):
+            return False
+    else:
+        return False
+
+    return isinstance(parsed, dict) and _extract_environment_risk_score(parsed) is not None
+
+
 def compute_roi_score(description: Optional[str]) -> Tuple[float, list[str]]:
     """Score the likelihood that the environment description represents a high-risk ROI."""
     cleaned = _normalize_text(description)
     if not cleaned:
+        logger.info(f"ROI compute: description is empty or null. Score=0.0")
         return 0.0, []
 
     matched_keywords: list[str] = []
@@ -84,6 +102,22 @@ def compute_roi_score(description: Optional[str]) -> Tuple[float, list[str]]:
             matched_keywords.append(keyword)
             keyword_score += weight
 
+    parsed_description = description if isinstance(description, dict) else None
+    if parsed_description is None and isinstance(description, str):
+        try:
+            parsed_description = json.loads(description)
+        except (TypeError, ValueError):
+            parsed_description = None
+    if not isinstance(parsed_description, dict):
+        parsed_description = None
+
+    flow_density = _normalize_text(str((parsed_description or {}).get("traffic_flow_density", "")))
+    high_traffic_density = flow_density in {"heavy", "congested"}
+
+    if high_traffic_density:
+        matched_keywords.append(flow_density)
+        keyword_score = max(keyword_score, 3.0)
+
     normalized_keyword_score = min(1.0, keyword_score / 4.0)
 
     parsed_score = _extract_environment_risk_score(description)
@@ -91,10 +125,19 @@ def compute_roi_score(description: Optional[str]) -> Tuple[float, list[str]]:
         if parsed_score > 1.0:
             parsed_score = min(1.0, parsed_score / 5.0)
         parsed_score = min(1.0, max(0.0, parsed_score))
+        if high_traffic_density:
+            parsed_score = max(parsed_score, 0.75)
         blended_score = min(1.0, 0.7 * parsed_score + 0.3 * normalized_keyword_score)
         combined_score = round(max(parsed_score, blended_score), 4)
+
+        logger.info(
+            f"ROI Score Breakdown: parsed={parsed_score:.4f}, "
+            f"keyword_raw={keyword_score:.2f}, keyword_norm={normalized_keyword_score:.4f}, "
+            f"blended={blended_score:.4f}, final={combined_score:.4f}"
+        )
         return combined_score, matched_keywords
 
+    logger.info(f"ROI Score Breakdown: No parsed score found. keyword_norm={normalized_keyword_score:.4f}, final={normalized_keyword_score:.4f}")
     return round(normalized_keyword_score, 4), matched_keywords
 
 
@@ -105,8 +148,25 @@ def should_process_window(
 ) -> bool:
     if not roi_enabled:
         return True
-    score, _ = compute_roi_score(description)
-    return score >= roi_threshold
+    if description is None or not description.strip():
+        logger.warning(
+            "ROI description is empty; processing window because risk could not be assessed."
+        )
+        return True
+    if not _has_structured_risk_score(description):
+        logger.warning(
+            "ROI description has no structured risk score; processing window because "
+            "risk could not be assessed."
+        )
+        return True
+    score, matched = compute_roi_score(description)
+    decision = score >= roi_threshold
+    logger.info(
+        f"ROI Check: score={score:.4f} (threshold={roi_threshold:.4f}), "
+        f"decision={decision}, matched_keywords={matched}, "
+        f"description={description}"
+    )
+    return decision
 
 
 DEFAULT_IMAGE_SCALE = float(CONFIG.get("processing", {}).get("image_scale", 0.7))

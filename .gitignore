@@ -209,4 +209,9 @@ __marimo__/
 
 data/
 outputs/
-ouptput/
+output/
+viz_results/
+tests/
+!tests/
+tests/*
+!tests/test_agent_persistence.py
